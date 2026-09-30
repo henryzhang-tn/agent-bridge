@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "agent_bridge": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/scripts/launch-mcp",
+      "env": {
+        "AGENT_BRIDGE_HOST": "generic"
+      }
+    }
+  }
+}

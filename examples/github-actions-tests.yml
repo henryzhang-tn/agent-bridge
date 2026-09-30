@@ -1,0 +1,26 @@
+# Optional template: copy to .github/workflows/test.yml to enable GitHub Actions.
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  bridge:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Test bridge and MCP without provider inference
+        run: node --test tests/bridge.test.mjs tests/mcp.test.mjs
+      - name: Check Hermes adapter syntax
+        run: python3 -c "import ast, pathlib; ast.parse(pathlib.Path('plugins/agent-bridge/scripts/hermes-adapter.py').read_text())"

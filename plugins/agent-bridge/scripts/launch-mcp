@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+bridge_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ -n "${AGENT_BRIDGE_NODE_PATH:-}" ] && [ -x "$AGENT_BRIDGE_NODE_PATH" ]; then
+  exec "$AGENT_BRIDGE_NODE_PATH" "$bridge_dir/mcp-server.mjs"
+fi
+if [ -n "${CODEX_MCP_NODE_PATH:-}" ] && [ -x "$CODEX_MCP_NODE_PATH" ]; then
+  exec "$CODEX_MCP_NODE_PATH" "$bridge_dir/mcp-server.mjs"
+fi
+if command -v node >/dev/null 2>&1; then
+  exec node "$bridge_dir/mcp-server.mjs"
+fi
+if [ "${AGENT_BRIDGE_HOST:-generic}" = codex ] && [ -x /Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node ]; then
+  exec /Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node "$bridge_dir/mcp-server.mjs"
+fi
+echo 'Agent Bridge requires Node.js 22+ on PATH or AGENT_BRIDGE_NODE_PATH.' >&2
+exit 1

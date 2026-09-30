@@ -1,0 +1,24 @@
+{
+  "name": "agent-bridge",
+  "version": "0.2.0+codex.20260929031659",
+  "description": "Let the current host agent dispatch scoped tasks to Z Code, Claude Code and Hermes, with explicit models and destination preflight.",
+  "author": {
+    "name": "Henry"
+  },
+  "repository": "https://github.com/henryzhang-tn/agent-bridge",
+  "license": "MIT",
+  "skills": "./skills/",
+  "mcpServers": "./mcp/codex.json",
+  "interface": {
+    "displayName": "Agent Bridge",
+    "shortDescription": "当前宿主调度 Z Code、Claude Code、Hermes，明确模型和发送范围。",
+    "longDescription": "Host-led worker selection, destination preflight, async execution and independent acceptance.",
+    "developerName": "Henry",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": "使用 Agent Bridge 完成任务，由当前宿主选择 worker 和模型，核对目的地授权后执行并验收。"
+  }
+}

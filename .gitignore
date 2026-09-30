@@ -1,0 +1,28 @@
+# Runtime files and credentials
+.DS_Store
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.log
+.ai/
+outputs/
+node_modules/
+__pycache__/
+*.pyc
+coverage/
+
+# Local validation records and the superseded standalone skill
+/validation.md
+/plugin-validation.md
+/multi-agent-validation.md
+/reliability-validation.md
+/zcode-worker/
+
+# These portable plugin manifests must be tracked, even if globally ignored.
+!/plugins/agent-bridge/.mcp.json
+!/plugins/agent-bridge/.codex-plugin/plugin.json
+!/plugins/agent-bridge/plugin.json
+!/plugins/agent-bridge/.claude-plugin/plugin.json
+!/plugins/agent-bridge/.zcode-plugin/plugin.json

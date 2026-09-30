@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "agent_bridge": {
+      "command": "./scripts/launch-mcp",
+      "cwd": ".",
+      "env": {
+        "AGENT_BRIDGE_HOST": "codex"
+      },
+      "env_vars": [
+        "PATH",
+        "HOME",
+        "CODEX_MCP_NODE_PATH",
+        "AGENT_BRIDGE_NODE_PATH"
+      ],
+      "startup_timeout_sec": 10,
+      "tool_timeout_sec": 60
+    }
+  }
+}

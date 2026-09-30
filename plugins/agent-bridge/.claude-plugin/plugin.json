@@ -1,0 +1,19 @@
+{
+  "name": "agent-bridge",
+  "version": "0.2.0+codex.20260929031659",
+  "description": "Let the current host agent dispatch scoped tasks to Z Code, Claude Code and Hermes, with explicit models and destination preflight.",
+  "author": {
+    "name": "Henry"
+  },
+  "repository": "https://github.com/henryzhang-tn/agent-bridge",
+  "license": "MIT",
+  "skills": "./skills/",
+  "mcpServers": {
+    "agent_bridge": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/scripts/launch-mcp",
+      "env": {
+        "AGENT_BRIDGE_HOST": "claude"
+      }
+    }
+  }
+}
