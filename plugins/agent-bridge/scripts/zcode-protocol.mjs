@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process';
 import readline from 'node:readline';
 import { workerEnv } from './bridge.mjs';
 import { zcodeDestination } from './destination.mjs';
+import { createProgressTracker } from './zcode-progress.mjs';
 
 const catalogOnly = process.argv[2] === '--models';
 const job = catalogOnly ? null : process.argv[2];
@@ -13,11 +14,12 @@ const state = catalogOnly ? {
   entry: fs.realpathSync(process.env.ZCODE_WORKER_ENTRY || '/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs'),
 } : JSON.parse(fs.readFileSync(job + '/state.json', 'utf8'));
 const prompt = catalogOnly ? null : fs.readFileSync(job + '/prompt.md', 'utf8');
+const progress = catalogOnly ? null : createProgressTracker(job);
 const child = spawn(process.execPath, [state.entry, 'app-server', '--stdio', '--cwd', state.project], {
   cwd: state.project, env: workerEnv(state.entry), stdio: ['pipe', 'pipe', 'pipe'],
 });
-process.once('SIGTERM', () => { child.kill('SIGTERM'); process.exit(143); });
-process.once('SIGINT', () => { child.kill('SIGTERM'); process.exit(130); });
+process.once('SIGTERM', () => { progress?.close(); child.kill('SIGTERM'); process.exit(143); });
+process.once('SIGINT', () => { progress?.close(); child.kill('SIGTERM'); process.exit(130); });
 child.stderr.on('data', data => fs.writeSync(2, data));
 let nextId = 0, terminalReason, sessionId, fatal;
 const pending = new Map();
@@ -52,17 +54,23 @@ readline.createInterface({ input: child.stdout }).on('line', line => {
         // A worker cannot approve its own permission requests or answer on the user's behalf.
         notes.push('Host interaction required: ' + msg.method);
         log({ type: 'interaction_blocked', method: msg.method });
+        progress?.blocked(msg.method);
         send({ id: msg.id, error: { code: -32601, message: 'This worker cannot authorize interactive requests. Return the blocker to the host.' } });
       }
     } else if (msg.id !== undefined) {
       const p = pending.get(msg.id);
       if (!p) return;
       pending.delete(msg.id); clearTimeout(p.timer);
-      if (msg.error) p.reject(new Error(msg.error.message)); else p.resolve(msg.result);
+      if (msg.error) p.reject(Object.assign(new Error(msg.error.message), { code: msg.error.code })); else p.resolve(msg.result);
+    } else if (msg.method === 'session/event') {
+      progress?.observe(msg.params || {});
     } else if (msg.method === 'state.updated') {
       const p = msg.params || {};
       log({ type: 'state', reason: p.reason, sessionId: p.sessionId });
-      if (p.sessionId === sessionId && ['prompt_completed', 'prompt_failed'].includes(p.reason)) terminalReason = p.reason;
+      if (p.sessionId === sessionId) {
+        progress?.state(p.reason);
+        if (['prompt_completed', 'prompt_failed'].includes(p.reason)) terminalReason = p.reason;
+      }
     }
   } catch (e) { fail(new Error('Invalid app-server response: ' + e.message)); }
 });
@@ -85,6 +93,7 @@ async function execute() {
   sessionId = initial.session?.sessionId;
   if (!sessionId) throw new Error('app-server returned no session ID');
   log({ type: 'session_ready', sessionId, collectOnly: !!collectSession });
+  progress?.bindSession(sessionId);
   const available = initial.settings?.model?.available || [];
   const currentProvider = initial.settings?.model?.current?.providerId;
   if (catalogOnly) {
@@ -106,6 +115,19 @@ async function execute() {
     if (state.destination && zcodeDestination(state.provider, workerEnv(state.entry)).endpoint !== state.destination.endpoint) throw new Error('Inference destination changed before sending the task; prepare again.');
     await request('session/setModel', { sessionId, model: selection, persistAsWorkspaceLastUsed: false });
     log({ type: 'selected_model', sessionId, model: selection, providerLabel: selected.providerLabel });
+    progress.selectModel(selection);
+    // Without a deliveryKind subscription the app-server emits no session/event
+    // notifications, even while the model is streaming and tools are running.
+    try {
+      const subscribed = await request('session/subscribe', { sessionId, deliveryKind: 'desktop-continuous', includeSnapshot: false });
+      progress.monitoring('subscribed');
+      for (const event of subscribed.events || []) progress.observe(event);
+      log({ type: 'progress_subscribed', sessionId });
+    } catch (e) {
+      if (e.code !== -32601) throw e;
+      progress.monitoring('unsupported');
+      log({ type: 'progress_unavailable', reason: 'session_subscription_unsupported' });
+    }
     await request('session/send', { sessionId, content: prompt, modelSelection: selection }, state.timeout * 1000);
     log({ type: 'send_acknowledged' });
   }
@@ -127,14 +149,17 @@ async function execute() {
   fs.writeFileSync(job + '/adapter-result.json', JSON.stringify(result), { mode: 0o600 });
   fs.writeSync(1, JSON.stringify(result) + '\n');
   log({ type: 'result_written' });
+  progress.finish(error || !response);
 }
 try {
   await execute();
 } catch (e) {
+  progress?.finish(true);
   log({ type: 'adapter_error', message: e.message });
   fs.writeSync(2, 'Z Code protocol adapter: ' + e.message + '\n');
   process.exitCode = 1;
 } finally {
+  progress?.close();
   if (sessionId && !fatal) {
     try { await request('session/close', { sessionId }, 5000); } catch (e) { log({ type: 'close_error', message: e.message }); }
   }

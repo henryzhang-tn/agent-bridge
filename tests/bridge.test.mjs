@@ -247,6 +247,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  if(m.id==='prefs'){send({id:create.id,result:snapshot});return;}
  if(m.method==='session/create'){create=m;send({id:'prefs',method:'session/requestRuntimePreferences',params:{sessionId:'sess_protocol',scope:'runtime-materialization'}});}
  else if(m.method==='session/setModel')send({id:m.id,result:snapshot});
+ else if(m.method==='session/subscribe')send({id:m.id,result:{sessionId:'sess_protocol',eventSeq:0,events:[]}});
  else if(m.method==='session/send')setTimeout(()=>{send({method:'state.updated',params:{sessionId:'sess_protocol',reason:'prompt_completed'}});send({id:m.id,result:{accepted:true}});},50);
  else if(m.method==='session/read')send({id:m.id,result:snapshot});
  else if(m.method==='session/usage')send({id:m.id,result:{inputTokens:42,outputTokens:8,modelRequestCount:1}});
@@ -275,6 +276,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   assert.equal(requests.find(x => x.id === 'prefs').result.askUserQuestionAutoResolutionEnabled, false);
   assert.equal(requests.find(x => x.method === 'session/setModel').params.persistAsWorkspaceLastUsed, false);
   assert.equal(requests.find(x => x.method === 'session/setModel').params.model.options.reasoningLevel, 'low');
+  assert.deepEqual(requests.find(x => x.method === 'session/subscribe').params, { sessionId: 'sess_protocol', deliveryKind: 'desktop-continuous', includeSnapshot: false });
   const stateFile = path.join(job, 'state.json');
   const stored = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
   stored.status = 'failed'; stored.error = 'Synthetic lost stdout forwarding';

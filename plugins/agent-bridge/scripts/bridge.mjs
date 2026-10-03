@@ -8,6 +8,7 @@ import { spawn, execFileSync, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { WORKERS, entryFor, workers } from './workers.mjs';
 import { hostName, destinationFor, endpoint } from './destination.mjs';
+import { readProgress } from './zcode-progress.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const ACTIVE = new Set(['queued', 'running', 'cancelling', 'orphaned']);
@@ -90,13 +91,15 @@ function getState(dir) {
   return s;
 }
 function brief(s) {
-  return { id: s.id, job: s.job, host: s.host || 'generic', worker: s.worker || 'zcode', status: s.status, mode: s.mode, sessionId: s.sessionId || null,
+  const progress = readProgress(s.job);
+  return { id: s.id, job: s.job, host: s.host || 'generic', worker: s.worker || 'zcode', status: s.status, mode: s.mode, sessionId: s.sessionId || progress?.sessionId || null,
     destination: s.destination || null, readScope: s.readScope || null,
     requestId: s.requestId || null,
     elapsedSeconds: Math.round(((s.finishedAt || Date.now()) - s.createdAt) / 1000),
     exitCode: s.exitCode ?? null, usage: s.usage ?? null, error: s.error ?? null,
     model: s.model, effort: s.effort, provider: s.provider || s.selectedModel?.providerId || null,
-    selectionReason: s.selectionReason || null, selectedModel: s.selectedModel || null,
+    selectionReason: s.selectionReason || null, selectedModel: s.selectedModel || progress?.selectedModel || null,
+    progress,
     result: exists(path.join(s.job, 'result.md')) ? path.join(s.job, 'result.md') : null };
 }
 async function reuseRequest(job, requestId, fingerprint, wait) {

@@ -22,7 +22,25 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  const m=JSON.parse(line);fs.appendFileSync('rpc.jsonl',JSON.stringify(m)+'\\n');
  if(m.method==='session/create')send({id:m.id,result:snapshot()});
  else if(m.method==='session/setModel'){selection=m.params.model;send({id:m.id,result:snapshot()});}
- else if(m.method==='session/send'){send({id:m.id,result:{accepted:true}});setTimeout(()=>send({method:'state.updated',params:{sessionId:'sess_fake',reason:'prompt_completed'}}),20);}
+ else if(m.method==='session/subscribe')send(fs.existsSync('unsupported-subscription') ? {id:m.id,error:{code:-32601,message:'Method not found'}} : {id:m.id,result:{sessionId:'sess_fake',eventSeq:0,events:[]}});
+ else if(m.method==='session/send'){
+  send({id:m.id,result:{accepted:true}});
+  const card=fs.readFileSync(m.params.content.match(/Read the task card at (.+\\/task\\.md)\\. Read/)[1],'utf8');
+  if(card.includes('PROGRESS_TEST')){
+   let seq=0;
+   const event=(type,payload)=>send({method:'session/event',params:{sessionId:'sess_fake',eventId:'ev_'+seq,seq:++seq,type,payload,timestamp:Date.now()}});
+   send({method:'state.updated',params:{sessionId:'sess_fake',reason:'prompt_started'}});
+   event('tool.updated',{kind:'scheduled',toolCallId:'read1',toolName:'Read',input:'PRIVATE_INPUT_MUST_NOT_LEAK'});
+   event('tool.updated',{kind:'started',toolCallId:'read1'});
+   event('tool.updated',{kind:'result',toolCallId:'read1',result:{success:true,content:'PRIVATE_RESULT_MUST_NOT_LEAK'},duration:12});
+   event('tool.updated',{kind:'started',toolCallId:'bash1',toolName:'Bash'});
+   setInterval(()=>{
+    if(fs.existsSync('pause-events'))return;
+    event('model.streaming',{kind:'reasoning_delta',delta:'PRIVATE_REASONING_MUST_NOT_LEAK'});
+    event('tool.updated',{kind:'progress',toolCallId:'bash1',elapsedMs:seq*200,stdoutBytes:seq*10,stdoutTail:'PRIVATE_STDOUT_MUST_NOT_LEAK'});
+   },200);
+  }else setTimeout(()=>send({method:'state.updated',params:{sessionId:'sess_fake',reason:'prompt_completed'}}),20);
+ }
  else if(m.method==='session/read')send({id:m.id,result:snapshot()});
  else if(m.method==='session/usage')send({id:m.id,result:{inputTokens:80,outputTokens:8}});
  else if(m.method==='session/close')send({id:m.id,result:{closed:true}});
@@ -133,6 +151,47 @@ test('MCP dispatch uses non-default model and effort; result records choice and 
   const set = f.requestLog().find(x => x.method === 'session/setModel').params;
   assert.deepEqual(set.model, { providerId: 'fixture', modelId: 'GLM-5.3-Flash', options: { reasoningLevel: 'high' } });
   assert.equal(set.persistAsWorkspaceLastUsed, false);
+});
+
+test('MCP exposes live tools and reasoning; idle time survives heartbeats, local reads and cancellation', async t => {
+  const f = fixture(t);
+  const job = (await f.dispatch({ task: 'PROGRESS_TEST synthetic activity only.' })).structuredContent.job;
+  const live = (await f.call('task_status', { job, wait_seconds: 2 })).structuredContent;
+  assert.equal(live.status, 'running'); assert.equal(live.sessionId, 'sess_fake');
+  assert.equal(live.selectedModel.modelId, f.args.model);
+  assert.equal(live.progress.monitoring, 'subscribed');
+  assert.ok(live.progress.reasoningCharacters > 0);
+  assert.equal(live.progress.tools.completed, 1); assert.equal(live.progress.tools.active, 1);
+  assert.equal(live.progress.tools.current[0].name, 'Bash');
+  assert.ok(live.progress.tools.current[0].stdoutBytes > 0);
+  assert.ok(!JSON.stringify(live).includes('PRIVATE_'));
+  assert.ok(!fs.readFileSync(path.join(job, 'progress.json'), 'utf8').includes('PRIVATE_'));
+  assert.ok(!fs.readFileSync(path.join(job, 'protocol-events.jsonl'), 'utf8').includes('PRIVATE_'));
+  fs.writeFileSync(path.join(f.root, 'pause-events'), 'pause');
+  const paused = (await f.call('task_status', { job, wait_seconds: 1 })).structuredContent;
+  const heartbeat = JSON.parse(fs.readFileSync(path.join(job, 'state.json'))).updatedAt;
+  const before = f.requestLog().length;
+  const idle = (await f.call('task_status', { job, wait_seconds: 2 })).structuredContent;
+  assert.equal(idle.status, 'running');
+  assert.equal(idle.progress.lastActivityAt, paused.progress.lastActivityAt);
+  assert.ok(idle.progress.idleSeconds >= 2);
+  assert.ok(JSON.parse(fs.readFileSync(path.join(job, 'state.json'))).updatedAt > heartbeat);
+  assert.equal(f.requestLog().length, before, 'task_status must not request new inference or session snapshots');
+  const stopped = (await f.call('cancel_task', { job })).structuredContent;
+  assert.equal(stopped.status, 'cancelled');
+  assert.equal(stopped.progress.tools.completed, 1);
+  assert.equal(stopped.progress.lastActivityAt, idle.progress.lastActivityAt);
+});
+
+test('older app-server without subscription reports unavailable monitoring and preserves result handling', async t => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.root, 'unsupported-subscription'), 'unsupported');
+  const job = (await f.dispatch()).structuredContent.job;
+  const done = (await f.call('task_status', { job, wait_seconds: 3 })).structuredContent;
+  assert.equal(done.status, 'ready_for_review');
+  assert.equal(done.progress.monitoring, 'unsupported');
+  assert.equal(done.progress.tools.total, 0);
+  assert.equal(f.requestLog().filter(x => x.method === 'session/send').length, 1);
 });
 
 test('unavailable model/provider/effort fails without inference or silent fallback', async t => {
