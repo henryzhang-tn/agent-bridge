@@ -57,11 +57,23 @@ Claude Code 市场安装：
 
 需要手动接入其他宿主时，`node scripts/host-config.mjs <host>` 可生成绝对路径配置。安装后重新加载宿主会话，检查 `list_workers` 返回的 `host`。
 
-安装后，在当前宿主会话中直接描述任务，无需手动填写 MCP 参数：
+安装后，直接调用 Skill 并描述任务：
 
-> 使用 Agent Bridge 分析 `<模块或问题>`，只读相关文件，给出原因和建议。由当前宿主选择合适的 worker 和模型。
+```text
+$agent-bridge:dispatch -w=zcode -m=GLM-5.3 -e=high 只读分析当前项目
+```
 
-> 使用 Agent Bridge 实现 `<具体需求>`，修改范围限定为 `<目录>`，完成后由当前宿主检查修改并运行相关验证。
+`-w` 指定 worker（`zcode / claude / hermes`），`-m` 指定模型，`-e` 指定推理强度。参数可省略，也支持用中文逗号分隔；未指定的参数由宿主选择。
+
+加 `-f` 表示预授权本次任务：宿主预检并说明当前配置的模型服务地址、项目范围和模式后，直接派发，不再重复确认。授权仅限本次任务；服务地址或范围变化时重新核对，系统审批仍保留。
+
+```text
+$agent-bridge:dispatch -w=zcode -m=GLM-5.3 -e=high -f 只读分析当前项目
+```
+
+```text
+$agent-bridge:dispatch -w=zcode 实现 <需求>，修改范围限定为 <目录>
+```
 
 宿主会发现可用 worker 和模型，预检实际服务地址及任务范围，核对授权后派发。可在同一会话中要求查看进度、读取结果或取消任务。
 

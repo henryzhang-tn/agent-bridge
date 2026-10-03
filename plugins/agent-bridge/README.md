@@ -17,6 +17,10 @@
 
 ## 调用约定
 
+聊天调用支持短参数：`$agent-bridge:dispatch -w=zcode -m=GLM-5.3 -e=high <任务>`。`-w / -m / -e` 分别对应 `worker / model / effort`，可省略，支持空格、英文或中文逗号分隔。宿主把短参数映射到 MCP 完整字段；CLI 仍使用现有长参数。
+
+`-f` 由宿主识别，表示用户预授权本次任务使用所选 worker 当前配置的模型服务及任务相关范围。仍须预检并说明实际目的地、项目、范围和模式，再直接派发；目的地或范围变化时重新核对。它不传入 MCP 或 CLI，也不改变系统审批、worker 交互阻塞或凭据保护。
+
 先发现模型，再调用 `prepare_dispatch`，提供 `worker / project / task / provider / model / effort / selection_reason / read_scope / mode`。`project` 为绝对路径；`read_scope` 为已有相对文件或目录，`[]` 表示不读源码，`["."]` 表示整个项目。相关项目指令和任务元数据仍可读取。
 
 宿主核对实际地址与用户授权后，以相同参数调用 `dispatch_task`，再提供预检返回的 `prepared_ref` 和 `destination.endpoint`（作为 `endpoint`），并分配 `request_id`。预检绑定范围、模型、模式、超时、宿主和运行时；目的地在提交和 worker 启动时重新核对。该机制不证明人类授权，也不限制操作系统文件访问。
