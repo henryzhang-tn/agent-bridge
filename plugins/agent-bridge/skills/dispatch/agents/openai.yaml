@@ -1,4 +1,4 @@
 interface:
   display_name: "Agent Bridge"
-  short_description: "调度 Z Code、Claude、Hermes，按任务选择模型并验收"
-  default_prompt: "使用 $dispatch 完成这个任务，由你选择执行 agent、模型和推理强度并验收结果。"
+  short_description: "质量优先调度，明确验收标准、推理配置与返修反馈"
+  default_prompt: "使用 $dispatch 完成这个任务，按质量优先规则选择模型和推理强度，提供 task_contract，独立验证后记录验收结果。"

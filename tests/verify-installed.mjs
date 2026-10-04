@@ -36,7 +36,7 @@ try {
   child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
   const listed = await rpc('tools/list', {});
   const tools = listed.tools.map(x => x.name);
-  for (const name of ['list_workers', 'list_models', 'prepare_dispatch', 'dispatch_task', 'task_status', 'task_result', 'cancel_task', 'recover_result']) assert(tools.includes(name));
+  for (const name of ['list_workers', 'list_models', 'prepare_dispatch', 'dispatch_task', 'task_status', 'task_result', 'record_review', 'continue_task', 'cancel_task', 'recover_result']) assert(tools.includes(name));
   const workers = (await call('list_workers', {})).workers;
   const catalogs = [];
   for (const worker of workers) {

@@ -8,10 +8,102 @@ import re
 import sys
 import urllib.request
 import urllib.error
+import threading
+import inspect
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import yaml
 from dotenv import dotenv_values
+
+
+class Progress:
+    """Compact persisted progress mirroring the Node adapters' progress.json.
+
+    Native callbacks record activity without persisting text or tool arguments.
+    Periodic reporting never changes the last runtime activity timestamp.
+    """
+
+    def __init__(self, job):
+        self.job = Path(job)
+        self.lock = threading.RLock()
+        self.stopped = threading.Event()
+        self.completed_calls = set()
+        self.data = {
+            "schema": 1, "jobId": self.job.name, "source": "hermes-runtime", "worker": "hermes",
+            "monitoring": "unsupported", "sessionId": None, "selectedModel": None, "phase": "starting",
+            "lastActivityAt": None, "lastActivity": None, "reasoningCharacters": 0, "responseCharacters": 0,
+            "hostInteractionRequired": False, "pendingInteractions": 0,
+            "tools": {"total": 0, "active": 0, "completed": 0, "failed": 0, "byName": {},
+                      "current": [], "lastCompleted": None},
+        }
+        self.reporter = threading.Thread(target=self._report, daemon=True)
+        self.reporter.start()
+
+    def _report(self):
+        while not self.stopped.wait(30):
+            self.write()
+
+    def close(self):
+        self.stopped.set()
+        self.write()
+
+    def _stamp(self):
+        return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    def write(self, phase=None, activity=None, **fields):
+        with self.lock:
+            self._write(phase, activity, **fields)
+
+    def _write(self, phase=None, activity=None, **fields):
+        if phase:
+            self.data["phase"] = "blocked" if self.data["hostInteractionRequired"] else phase
+        if activity:
+            self.data["lastActivityAt"] = self._stamp()
+            self.data["lastActivity"] = {"type": activity}
+        for key, value in fields.items():
+            self.data[key] = value
+        self.data["reportedAt"] = self._stamp()
+        tmp = self.job / ("progress.json." + os.urandom(4).hex() + ".tmp")
+        tmp.write_text(json.dumps(self.data) + "\n")
+        tmp.chmod(0o600)
+        tmp.replace(self.job / "progress.json")
+
+    def stream(self, kind, text):
+        with self.lock:
+            key = "reasoningCharacters" if kind == "reasoning" else "responseCharacters"
+            self.data[key] += len(text) if isinstance(text, str) else 0
+            self.write(phase="reasoning" if kind == "reasoning" else "responding", activity="model_streaming")
+
+    def tool(self, call_id, name, failed=None):
+        if not isinstance(call_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:/-]{1,200}", call_id):
+            return
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.:/-]{1,200}", name):
+            name = "unknown"
+        with self.lock:
+            tools = self.data["tools"]
+            current = next((x for x in tools["current"] if x["id"] == call_id), None)
+            if failed is None:
+                if current or call_id in self.completed_calls:
+                    return
+                current = {"id": call_id, "name": name, "status": "running", "startedAt": self._stamp()}
+                tools["current"].append(current)
+                tools["total"] += 1
+                tools["active"] += 1
+                stats = tools["byName"].setdefault(name, {"total": 0, "completed": 0, "failed": 0})
+                stats["total"] += 1
+            elif current:
+                tools["current"].remove(current)
+                tools["active"] -= 1
+                key = "failed" if failed else "completed"
+                current["status"] = key
+                tools[key] += 1
+                tools["byName"][current["name"]][key] += 1
+                tools["lastCompleted"] = current
+                self.completed_calls.add(call_id)
+            else:
+                return
+            self.write(phase="tools" if tools["active"] else "waiting_for_model", activity="tool_started" if failed is None else "tool_completed")
 
 
 def settings():
@@ -91,9 +183,13 @@ def run_job(job, config, available):
     sys.path.insert(0, str(runtime))
     os.chdir(state["project"])
     notes = []
+    progress = Progress(job)
+    progress.write(phase="waiting_for_model", activity="process_started")
 
     def deny_approval(*args, **kwargs):
         notes.append("Hermes requested an interactive approval; the host must handle the blocked action.")
+        progress.data["hostInteractionRequired"] = True
+        progress.write(activity="interaction_blocked")
         return "deny"
 
     with contextlib.redirect_stdout(sys.stderr):
@@ -104,20 +200,37 @@ def run_job(job, config, available):
         # Forward supported GLM parameters explicitly; also pass them through the
         # native reasoning adapter so the selected effort survives payload building.
         overrides = {} if reasoning is None else {"extra_body": {"thinking": {"type": "enabled"}, "reasoning_effort": state["effort"]}}
+        params = inspect.signature(AIAgent).parameters
+        callbacks = {
+            "tool_start_callback": lambda call_id, name, args: progress.tool(call_id, name),
+            "tool_complete_callback": lambda call_id, name, args, result: progress.tool(call_id, name, isinstance(result, dict) and bool(result.get("error"))),
+            "reasoning_callback": lambda text: progress.stream("reasoning", text),
+            "step_callback": lambda *args: progress.write(phase="waiting_for_model", activity="model_step_started"),
+        }
+        supported = {key: cb for key, cb in callbacks.items() if key in params}
+        progress.write(monitoring="subscribed" if len(supported) == len(callbacks) else "unsupported")
         agent = AIAgent(base_url=config["base"], api_key=config["secret"], provider=state["provider"],
                         api_mode="chat_completions", model=state["model"], reasoning_config=reasoning,
-                        request_overrides=overrides, max_iterations=24, tool_delay=0,
+                        request_overrides=overrides, tool_delay=0,
                         enabled_toolsets=["file"] if state["mode"] == "plan" else ["file", "terminal"],
                         skip_context_files=True, skip_memory=True, load_soul_identity=False,
                         save_trajectories=False, quiet_mode=True, verbose_logging=False,
-                        fallback_model={}, checkpoints_enabled=False, session_id="bridge_" + state["id"])
+                        fallback_model={}, checkpoints_enabled=False, session_id="bridge_" + state["id"], **supported)
+        progress.write(sessionId=agent.session_id, selectedModel={"providerId": state["provider"], "modelId": state["model"], "options": {"reasoningLevel": state["effort"]}})
         allowed = {"read_file", "search_files"}
         if state["mode"] != "plan":
             allowed.update(("write_file", "patch", "terminal", "process"))
         agent.tools = [t for t in (agent.tools or []) if t["function"]["name"] in allowed]
         agent.valid_tool_names = {t["function"]["name"] for t in agent.tools}
-        raw = agent.run_conversation(user_message=(job / "prompt.md").read_text() + "\nTask card:\n" + (job / "task.md").read_text())
+        stream = {"stream_callback": lambda text: progress.stream("response", text)} if "stream_callback" in inspect.signature(agent.run_conversation).parameters else {}
+        try:
+            raw = agent.run_conversation(user_message=(job / "prompt.md").read_text() + "\nTask card:\n" + (job / "task.md").read_text(), **stream)
+        finally:
+            progress.close()
         set_approval_callback(None)
+    progress.data["sessionId"] = agent.session_id
+    progress.data["selectedModel"] = {"providerId": state["provider"], "modelId": state["model"],
+                                      "options": {"reasoningLevel": state["effort"]}}
     if raw.get("failed") or raw.get("error") or raw.get("partial") or raw.get("interrupted") or not raw.get("completed"):
         notes.append("Hermes did not complete normally; inspect the local job logs and partial edits.")
     if raw.get("model") != state["model"] or raw.get("provider") != state["provider"]:
@@ -129,6 +242,10 @@ def run_job(job, config, available):
               "response": (response or "; ".join(notes)).replace(config["secret"], "[redacted]"),
               "notes": notes, "providerLabel": "Hermes / configured " + state["provider"],
               "model": {"providerId": state["provider"], "modelId": state["model"], "options": {"reasoningLevel": state["effort"]}},
+              "effortEvidence": {"requested": state["effort"], "sentToRuntime": state["effort"] if reasoning else None,
+                                 "parameter": "reasoning_config / request_overrides.extra_body.reasoning_effort",
+                                 "supportedLevels": selected["reasoning_levels"], "runtimeConfirmed": None,
+                                 "confirmationSource": None, "providerConfirmed": None},
               "usage": {"inputTokens": raw.get("input_tokens"), "outputTokens": raw.get("output_tokens"),
                         "totalTokens": raw.get("total_tokens"), "reasoningTokens": raw.get("reasoning_tokens"),
                         "cacheReadTokens": raw.get("cache_read_tokens"), "modelRequestCount": raw.get("api_calls")},
@@ -136,6 +253,7 @@ def run_job(job, config, available):
     output = job / "adapter-result.json"
     output.write_text(json.dumps(result, ensure_ascii=False))
     output.chmod(0o600)
+    progress.write(phase="failed" if notes else "completed", activity="result_written")
 
 
 if __name__ == "__main__":

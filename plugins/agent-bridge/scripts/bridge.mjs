@@ -9,6 +9,7 @@ import { promisify } from 'node:util';
 import { WORKERS, entryFor, workers } from './workers.mjs';
 import { hostName, destinationFor, endpoint } from './destination.mjs';
 import { readProgress } from './zcode-progress.mjs';
+import { taskContract, reviewChecks, qualitySummary, catalogGuidance } from './quality.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const ACTIVE = new Set(['queued', 'running', 'cancelling', 'orphaned']);
@@ -33,7 +34,7 @@ function groupAlive(pid) {
 const hash = value => createHash('sha256').update(value).digest('hex');
 function args(argv) {
   const result = { command: argv.shift() || 'help' };
-  const valid = new Set(['project', 'task-file', 'mode', 'timeout', 'job', 'wait', 'model', 'effort', 'provider', 'selection-reason', 'worker', 'request-id', 'read-scope', 'prepared-ref', 'endpoint']);
+  const valid = new Set(['project', 'task-file', 'task-contract-file', 'review-file', 'review-id', 'mode', 'timeout', 'job', 'wait', 'model', 'effort', 'provider', 'selection-reason', 'worker', 'request-id', 'read-scope', 'prepared-ref', 'endpoint']);
   while (argv.length) {
     const key = argv.shift();
     if (!key?.startsWith('--') || !valid.has(key.slice(2)) || !argv.length) throw new Error('Invalid argument: ' + key);
@@ -92,13 +93,20 @@ function getState(dir) {
 }
 function brief(s) {
   const progress = readProgress(s.job);
+  const review = readReview(s);
   return { id: s.id, job: s.job, host: s.host || 'generic', worker: s.worker || 'zcode', status: s.status, mode: s.mode, sessionId: s.sessionId || progress?.sessionId || null,
     destination: s.destination || null, readScope: s.readScope || null,
     requestId: s.requestId || null,
+    ...(s.resume ? { continuation: { of: s.continuationOf, mode: s.resume.mode, previousSessionId: s.resume.sessionId || null } } : {}),
     elapsedSeconds: Math.round(((s.finishedAt || Date.now()) - s.createdAt) / 1000),
     exitCode: s.exitCode ?? null, usage: s.usage ?? null, error: s.error ?? null,
     model: s.model, effort: s.effort, provider: s.provider || s.selectedModel?.providerId || null,
     selectionReason: s.selectionReason || null, selectedModel: s.selectedModel || progress?.selectedModel || null,
+    effortEvidence: s.effortEvidence || { requested: s.effort, sentToRuntime: null, runtimeConfirmed: null, providerConfirmed: null, parameter: null, supportedLevels: [], confirmationSource: null },
+    taskContract: s.taskContract || null, quality: qualitySummary(s, review),
+    review: review ? { id: review.id, status: review.status, reviewedAt: review.reviewedAt,
+      remainingCriteria: review.checks.filter(c => c.status !== 'passed').map(c => c.criterion_id) } : null,
+    timeBudgetSeconds: s.timeout ?? null,
     progress,
     result: exists(path.join(s.job, 'result.md')) ? path.join(s.job, 'result.md') : null };
 }
@@ -119,15 +127,25 @@ function redact(text) {
     .replace(/\bsk-[A-Za-z0-9_-]+/g, '[redacted]');
 }
 function promptFor(s) {
+  const continuation = s.resume ? '' +
+    `This is an explicit host-controlled continuation of a previous task (${s.resume.previousJob}), not an automatic retry.\n` +
+    `Continuation mode: ${s.resume.mode}${s.resume.mode === 'native' ? ` (the previous runtime session ${s.resume.sessionId} was resumed natively)` : ' (this worker has no native resume; a fresh runtime session was started from the recorded checkpoint)'}.\n` +
+    `Recorded checkpoint state: ${JSON.stringify(s.resume.checkpoint || {})}.\n` +
+    `Previous artifacts may exist; verify current project state and the previous job directory before continuing, and do not redo work the checkpoint already records.\n` : '';
+  const contract = s.taskContract ? `Task contract: ${JSON.stringify(s.taskContract)}.\n` +
+    `Implement every acceptance criterion. Allowed edits are the contract's allowed_edits only (instructions, not an OS sandbox). Preserve the listed behavior and changes.\n` +
+    `Report each criterion ID, what was implemented, checks actually run and evidence; explicitly mark any failed or unverified criterion. Source inspection or mocks do not establish runtime verification. The host owns final acceptance.\n` : '';
   return `You are the ${s.worker || 'zcode'} implementation worker for one task assigned by the ${s.host || 'current'} host agent.\n` +
     `Work only in this project: ${s.project}\n` +
     `Declared source read scope (relative to the project): ${JSON.stringify(s.readScope || ['.'])}. Do not read source outside this scope. Task metadata and relevant project instructions may be read.\n` +
     `Read the task card at ${path.join(s.job, 'task.md')}. Read relevant project instructions and only the source needed for that task.\n` +
+    continuation + contract +
+    (s.resume?.reviewFeedback?.length ? `Previous host review found these failed or unverified items: ${JSON.stringify(s.resume.reviewFeedback)}. Address this feedback and preserve already-passing behavior.\n` : '') +
     `Preserve existing user changes. Do not modify .ai task metadata. Do not start other agents or delegate back to the host. ` +
     `Do not commit, push, deploy, install dependencies, modify global configuration, or contact external services unless the task explicitly includes that action.\n` +
     (s.mode === 'plan' ? `This is an analysis-only task: do not edit project files.\n` : '') +
     `If a permission or missing requirement prevents progress, report it; do not bypass it.\n` +
-    `End with a concise summary (aim for 1500 characters): outcome, changed file paths, checks actually run and results, blockers or remaining risks. ` +
+    `End with a concise summary: outcome, criterion IDs and evidence, changed file paths, checks actually run and results, blockers or remaining risks. Do not omit unverified criteria to shorten the summary. ` +
     `The host agent will independently review the changes. Do not write a long transcript or paste entire files.\n`;
 }
 export function workerEnv(entry) {
@@ -163,7 +181,9 @@ function selection(o) {
   if (!task.trim() || task.length > 24000) throw new Error('Task must contain 1–24000 characters; use file references for large context.');
   const mode = o.mode || 'edit';
   if (!['edit', 'plan', 'build'].includes(mode)) throw new Error('Supported modes: edit, plan, build. Permission bypass modes are not supported.');
-  const timeout = seconds(o.timeout, 600, 3600);
+  // No default total-time deadline: an explicitly supplied positive budget is
+  // the only enforced wall-clock limit and may exceed one hour.
+  const timeout = o.timeout === undefined ? null : seconds(o.timeout, 1, 2592000);
   const worker = o.worker;
   if (!WORKERS.includes(worker)) throw new Error('Unknown worker: ' + worker);
   const model = o.model;
@@ -173,7 +193,7 @@ function selection(o) {
   const selectionReason = o['selection-reason'] || null;
   if (selectionReason && selectionReason.length > 500) throw new Error('Keep the selection reason within 500 characters');
   const transport = worker === 'zcode' ? process.env.ZCODE_WORKER_TRANSPORT || 'app-server' : worker;
-  if (!['app-server', 'prompt', 'claude', 'hermes'].includes(transport)) throw new Error('Unsupported worker transport');
+  if (!['app-server', 'prompt', 'claude', 'codex', 'hermes'].includes(transport)) throw new Error('Unsupported worker transport');
   let readScope;
   try { readScope = JSON.parse(o['read-scope'] || '["."]'); } catch { throw new Error('--read-scope must be a JSON array of relative project paths'); }
   if (!Array.isArray(readScope) || readScope.length > 50) throw new Error('Invalid read scope');
@@ -183,10 +203,50 @@ function selection(o) {
     if (relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) throw new Error('Read scope escapes the project');
     return relative || '.';
   }))].sort();
-  return { project, task, worker, model, effort, provider: o.provider, mode, timeout, transport, selectionReason, readScope, host: hostName() };
+  const contract = taskContract(o['task-contract-file'] === undefined ? undefined : readJSON(o['task-contract-file']), { mode, readScope });
+  return { project, task, worker, model, effort, provider: o.provider, mode, timeout, transport, selectionReason, readScope, host: hostName(), taskContract: contract };
 }
 const selectionFingerprint = s => hash(JSON.stringify({ task: s.task, worker: s.worker, model: s.model, effort: s.effort,
-  provider: s.provider, mode: s.mode, timeout: s.timeout, transport: s.transport, readScope: s.readScope, host: s.host }));
+  provider: s.provider, mode: s.mode, timeout: s.timeout, transport: s.transport, readScope: s.readScope, host: s.host,
+  ...(s.taskContract ? { taskContract: s.taskContract } : {}) }));
+// Which workers can reopen their previous runtime session natively. Others get
+// checkpoint-based continuation (a fresh session seeded with recorded state).
+const NATIVE_RESUME = { zcode: true, codex: true, claude: true, hermes: false };
+function projectArtifacts(s) {
+  const allowed = file => !file.startsWith('.ai/') && (s.readScope || ['.']).some(p => p === '.' || file === p || file.startsWith(p + '/'));
+  try {
+    const raw = execFileSync('git', ['status', '--porcelain=v1', '-z', '--untracked-files=all'], { cwd: s.project, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 1024 * 1024 });
+    const records = raw.split('\0'), observed = [];
+    for (let i = 0; i < records.length && observed.length < 256; i++) {
+      const record = records[i]; if (!record) continue;
+      const file = record.slice(3), status = record.slice(0, 2);
+      if (status.includes('R') || status.includes('C')) i++;
+      if (!allowed(file)) continue;
+      let modifiedAt = null; try { modifiedAt = fs.lstatSync(path.join(s.project, file)).mtimeMs; } catch {}
+      observed.push({ path: file, status, modifiedAt });
+    }
+    return observed;
+  } catch { return null; } // Non-Git projects still retain runtime/result references.
+}
+// Periodic atomic checkpoint: runtime session id plus compact phase/tool
+// metadata and already-produced artifacts. Never reasoning text, source
+// contents, credentials or tool arguments. Writing it is not task activity.
+function writeCheckpoint(dir, s) {
+  const progress = readProgress(dir);
+  const checkpoint = { schema: 1, jobId: s.id, worker: s.worker,
+    sessionId: s.sessionId || progress?.sessionId || null,
+    resumeSupport: NATIVE_RESUME[s.worker] && ['app-server', 'codex', 'claude'].includes(s.transport) ? 'native' : 'checkpoint',
+    phase: progress?.phase || s.status, lastActivityAt: progress?.lastActivityAt || null,
+    achievements: { toolsTotal: progress?.tools?.total ?? null, toolsCompleted: progress?.tools?.completed ?? null,
+      toolsFailed: progress?.tools?.failed ?? null, toolsActive: progress?.tools?.active ?? null,
+      reasoningObserved: (progress?.reasoningCharacters || 0) > 0, responseObserved: (progress?.responseCharacters || 0) > 0,
+      hostInteractionPending: (progress?.pendingInteractions || 0) > 0 || !!progress?.hostInteractionRequired },
+    artifacts: { summary: exists(path.join(dir, 'result.md')), adapterResult: exists(path.join(dir, 'adapter-result.json')),
+      observedChanges: projectArtifacts(s), baselineChanges: s.baselineArtifacts || null },
+    savedAt: new Date().toISOString() };
+  atomic(path.join(dir, 'checkpoint.json'), checkpoint);
+  return checkpoint;
+}
 function scopeTargets(project, readScope) {
   return readScope.map(p => {
     const resolved = fs.realpathSync(path.join(project, p));
@@ -200,7 +260,7 @@ async function prepare(o) {
   const selected = selection(o);
   const entry = selected.worker === 'hermes' ? path.resolve(entryFor(selected.worker)) : fs.realpathSync(entryFor(selected.worker));
   if (!exists(entry)) throw new Error('Worker runtime is not installed: ' + selected.worker);
-  const destination = await destinationFor(selected.worker, selected.provider, selected.worker === 'zcode' ? workerEnv(entry) : process.env);
+  const destination = await destinationFor(selected.worker, selected.provider, selected.worker === 'zcode' ? workerEnv(entry) : process.env, selected.project);
   const readTargets = scopeTargets(selected.project, selected.readScope);
   const preparedRef = randomBytes(16).toString('hex');
   const expiresAt = Date.now() + 30 * 60 * 1000;
@@ -209,7 +269,8 @@ async function prepare(o) {
   atomic(path.join(selected.project, '.ai', 'preparations', preparedRef + '.json'), record);
   output({ ...record, host: selected.host, worker: selected.worker, project: selected.project, provider: selected.provider,
     model: selected.model, effort: selected.effort, mode: selected.mode, timeoutSeconds: selected.timeout,
-    readScope: selected.readScope, task: selected.task, inferenceDispatched: false,
+    readScope: selected.readScope, task: selected.task, taskContract: selected.taskContract,
+    quality: qualitySummary(selected, null), inferenceDispatched: false,
     authorization: 'Host must verify direct user authorization for this destination and scope. A prepared reference is not approval.',
     scopeEnforcement: 'Declared worker instructions, not an OS sandbox; project instructions and task metadata are also readable.' });
 }
@@ -224,44 +285,29 @@ async function verifyPreparation(o, selected, entry) {
   if (record.schema !== 1 || record.preparedRef !== o['prepared-ref'] || !Number.isInteger(record.expiresAt) || record.expiresAt < Date.now()) throw new Error('Preparation expired or invalid; prepare again.');
   if (record.fingerprint !== selectionFingerprint(selected) || record.entry !== entry) throw new Error('Task, host, scope or runtime changed since preparation; prepare again.');
   if (JSON.stringify(record.readTargets) !== JSON.stringify(scopeTargets(selected.project, selected.readScope))) throw new Error('Read scope targets changed since preparation; prepare again.');
-  const actual = await destinationFor(selected.worker, selected.provider, selected.worker === 'zcode' ? workerEnv(entry) : process.env);
+  const actual = await destinationFor(selected.worker, selected.provider, selected.worker === 'zcode' ? workerEnv(entry) : process.env, selected.project);
   if (record.destination?.provider !== actual.provider || record.destination?.endpoint !== actual.endpoint || endpoint(o.endpoint) !== actual.endpoint) throw new Error('Inference destination changed since preparation; prepare again and verify authorization.');
   return { destination: actual, readTargets: record.readTargets };
 }
 
-async function submit(o) {
-  const selected = selection(o);
-  const { project, task, worker, model, effort, mode, timeout, transport, selectionReason, host, readScope } = selected;
-  const wait = o.wait === undefined ? 0 : seconds(o.wait, 1, 55);
-  const requestId = o['request-id'] || null;
-  if (o['request-id'] !== undefined && !/^[A-Za-z0-9._:-]{1,128}$/.test(o['request-id'])) throw new Error('request_id must contain 1–128 letters, digits, dots, underscores, colons or hyphens.');
-  const fingerprint = requestId ? hash(selectionFingerprint(selected) + '\n' + (o.endpoint || '')) : null;
-  const id = requestId ? 'request-' + hash(requestId) : new Date().toISOString().replace(/[-:.]/g, '') + '-' + randomBytes(4).toString('hex');
-  const job = path.join(project, '.ai', 'tasks', id);
-  if (requestId && exists(job)) return reuseRequest(job, requestId, fingerprint, wait);
+function reserveEntry(selected) {
+  // Keep the Python venv path: resolving its symlink would lose installed dependencies.
+  const entry = selected.worker === 'hermes' ? path.resolve(entryFor(selected.worker)) : fs.realpathSync(entryFor(selected.worker));
+  if (!exists(entry)) throw new Error('Worker runtime is not installed: ' + selected.worker);
+  return entry;
+}
+function checkProjectLock(project) {
   const lock = path.join(project, '.ai', 'zcode-worker.lock');
   if (exists(lock) && exists(path.join(lock, 'owner.json'))) {
     const owner = readJSON(path.join(lock, 'owner.json')); getState(jobDir(owner.job));
     if (exists(lock)) throw new Error('A worker already owns this project: ' + owner.job);
   }
-  // Keep the Python venv path: resolving its symlink would lose installed dependencies.
-  const entry = worker === 'hermes' ? path.resolve(entryFor(worker)) : fs.realpathSync(entryFor(worker));
-  if (!exists(entry)) throw new Error('Worker runtime is not installed: ' + worker);
-  const { destination, readTargets } = await verifyPreparation(o, selected, entry);
-  directory(path.join(project, '.ai')); directory(path.join(project, '.ai', 'tasks'));
-  // The deterministic request directory is an exclusive, durable reservation.
-  // Concurrent retries can inspect it but can never launch a second supervisor.
-  try { fs.mkdirSync(job, { mode: 0o700 }); }
-  catch (e) {
-    if (requestId && e.code === 'EEXIST') return reuseRequest(job, requestId, fingerprint, wait);
-    throw e;
-  }
+}
+async function launch(job, s, task) {
+  const lock = path.join(s.project, '.ai', 'zcode-worker.lock');
   let child, ownsLock = false;
-  const s = { schema: 1, id, job, project, worker, mode, model, effort, provider: o.provider, selectionReason, transport, timeout, entry,
-    host, readScope, readTargets, destination, preparedRef: o['prepared-ref'],
-    requestId, requestFingerprint: fingerprint, launcherPid: process.pid,
-    status: 'queued', createdAt: Date.now(), updatedAt: Date.now(), runnerPid: null, childPid: null };
   try {
+    s.baselineArtifacts = projectArtifacts(s);
     atomic(path.join(job, 'task.md'), task);
     atomic(path.join(job, 'state.json'), s);
     if (exists(lock)) {
@@ -270,16 +316,16 @@ async function submit(o) {
       if (exists(lock)) {
         const owner = readJSON(path.join(lock, 'owner.json'));
         getState(jobDir(owner.job));
-        if (exists(lock)) throw new Error('A worker already owns this project: ' + owner.job);
+        if (exists(lock)) throw new Error('A worker already owns this project; inspect the active job before retrying.');
       }
     }
     try { fs.mkdirSync(lock, { mode: 0o700 }); }
     catch (e) { if (e.code === 'EEXIST') throw new Error('A worker already owns this project; inspect the active job before retrying.'); throw e; }
     ownsLock = true;
-    atomic(path.join(lock, 'owner.json'), { id, job });
+    atomic(path.join(lock, 'owner.json'), { id: s.id, job });
     const fd = fs.openSync(path.join(job, 'supervisor.log'), 'a', 0o600);
     try {
-      child = spawn(process.execPath, [SELF, '_run', '--job', job], { detached: true, cwd: project, stdio: ['ignore', fd, fd] });
+      child = spawn(process.execPath, [SELF, '_run', '--job', job], { detached: true, cwd: s.project, stdio: ['ignore', fd, fd] });
       await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
       child.unref();
     } finally { fs.closeSync(fd); }
@@ -297,8 +343,94 @@ async function submit(o) {
   // Wait for startup acknowledgement, so a caller never mistakes a queued record for a running worker.
   const deadline = Date.now() + 5000;
   while (getState(job).status === 'queued' && Date.now() < deadline) await sleep(100);
+}
+
+async function submit(o) {
+  const selected = selection(o);
+  const { project, task, worker, model, effort, mode, timeout, transport, selectionReason, host, readScope } = selected;
+  const wait = o.wait === undefined ? 0 : seconds(o.wait, 1, 55);
+  const requestId = o['request-id'] || null;
+  if (o['request-id'] !== undefined && !/^[A-Za-z0-9._:-]{1,128}$/.test(o['request-id'])) throw new Error('request_id must contain 1–128 letters, digits, dots, underscores, colons or hyphens.');
+  const fingerprint = requestId ? hash(selectionFingerprint(selected) + '\n' + (o.endpoint || '')) : null;
+  const id = requestId ? 'request-' + hash(requestId) : new Date().toISOString().replace(/[-:.]/g, '') + '-' + randomBytes(4).toString('hex');
+  const job = path.join(project, '.ai', 'tasks', id);
+  if (requestId && exists(job)) return reuseRequest(job, requestId, fingerprint, wait);
+  checkProjectLock(project);
+  const entry = reserveEntry(selected);
+  const { destination, readTargets } = await verifyPreparation(o, selected, entry);
+  directory(path.join(project, '.ai')); directory(path.join(project, '.ai', 'tasks'));
+  // The deterministic request directory is an exclusive, durable reservation.
+  // Concurrent retries can inspect it but can never launch a second supervisor.
+  try { fs.mkdirSync(job, { mode: 0o700 }); }
+  catch (e) {
+    if (requestId && e.code === 'EEXIST') return reuseRequest(job, requestId, fingerprint, wait);
+    throw e;
+  }
+  const s = { schema: 1, id, job, project, worker, mode, model, effort, provider: o.provider, selectionReason, transport, timeout, entry,
+    host, readScope, readTargets, destination, preparedRef: o['prepared-ref'], taskContract: selected.taskContract, reworkCount: 0,
+    requestId, requestFingerprint: fingerprint, launcherPid: process.pid,
+    status: 'queued', createdAt: Date.now(), updatedAt: Date.now(), runnerPid: null, childPid: null };
+  await launch(job, s, task);
   if (wait) await waitFor(job, wait);
   output({ ...brief(getState(job)), reused: false });
+}
+
+// Explicit, host-controlled continuation of an ended job. Never automatic:
+// it needs a fresh preparation, a fresh request identity, the unchanged
+// selection/scope, and both the old supervisor and worker must be gone.
+async function continueJob(o) {
+  const selected = selection(o);
+  const { project, task, worker, model, effort, mode, timeout, transport, selectionReason, host, readScope } = selected;
+  if (!o['request-id']) throw new Error('continue requires a fresh --request-id for this intentional continuation.');
+  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(o['request-id'])) throw new Error('request_id must contain 1–128 letters, digits, dots, underscores, colons or hyphens.');
+  const wait = o.wait === undefined ? 0 : seconds(o.wait, 1, 55);
+  const origDir = jobDir(o.job);
+  const requestId = o['request-id'];
+  const fingerprint = hash(selectionFingerprint(selected) + '\n' + (o.endpoint || '') + '\ncontinue:' + origDir);
+  const id = 'request-' + hash(requestId);
+  const job = path.join(project, '.ai', 'tasks', id);
+  if (exists(job)) {
+    if (readJSON(path.join(job, 'state.json')).previousJob !== origDir) throw new Error('request_id is already in use; intentional continuation needs a fresh request_id.');
+    return reuseRequest(job, requestId, fingerprint, wait);
+  }
+  const orig = getState(origDir);
+  if (ACTIVE.has(orig.status)) throw new Error('Refusing to continue: the original task is still ' + orig.status + '. Cancel it or let it end first.');
+  if (alive(orig.runnerPid) || alive(orig.childPid) || groupAlive(orig.childPid)) throw new Error('Refusing to continue: the original supervisor or worker process is still alive. Cancel it first.');
+  if (orig.project !== project) throw new Error('The continuation project differs from the original task; use a new dispatch.');
+  for (const key of ['worker', 'provider', 'model', 'effort', 'mode', 'transport', 'host']) {
+    if (String(orig[key] ?? '') !== String(selected[key] ?? '')) throw new Error('Continuation must keep the original ' + key + '; a changed selection requires a new dispatch.');
+  }
+  if (JSON.stringify(orig.readScope || []) !== JSON.stringify(readScope)) throw new Error('Continuation must keep the original read scope; a changed scope requires new authorization.');
+  if (orig.taskContract && JSON.stringify(orig.taskContract) !== JSON.stringify(selected.taskContract)) throw new Error('Continuation must preserve the original task_contract and acceptance criteria; changed requirements need a new dispatch.');
+  const previousReview = readReview(orig);
+  let checkpoint = null;
+  try { checkpoint = readJSON(path.join(origDir, 'checkpoint.json')); } catch {}
+  if (!checkpoint || checkpoint.schema !== 1 || checkpoint.jobId !== orig.id) throw new Error('No usable checkpoint found in ' + origDir + '; start a new dispatch instead.');
+  // Native resume only where the dispatched transport can actually reopen the session.
+  const native = NATIVE_RESUME[worker] && checkpoint.sessionId && ['app-server', 'codex', 'claude'].includes(transport);
+  const resume = { mode: native ? 'native' : 'checkpoint', sessionId: native ? checkpoint.sessionId : null,
+    previousJob: origDir, runtimeProfile: worker === 'claude' ? orig.resume?.runtimeProfile || path.join(origDir, 'claude-runtime') : null,
+    checkpoint: { phase: checkpoint.phase, lastActivityAt: checkpoint.lastActivityAt,
+      achievements: checkpoint.achievements ?? null, artifacts: checkpoint.artifacts ?? null },
+    reviewFeedback: previousReview?.checks.filter(c => c.status !== 'passed') || [] };
+  // Destination, selection and read scope are re-preflighted through a fresh preparation.
+  const entry = reserveEntry(selected);
+  const { destination, readTargets } = await verifyPreparation(o, selected, entry);
+  if (orig.readTargets && JSON.stringify(orig.readTargets) !== JSON.stringify(readTargets)) throw new Error('Continuation read scope targets changed; start a new dispatch and verify authorization.');
+  if (orig.destination && JSON.stringify(orig.destination) !== JSON.stringify(destination)) throw new Error('Continuation destination changed; start a new dispatch and verify authorization.');
+  checkProjectLock(project);
+  directory(path.join(project, '.ai')); directory(path.join(project, '.ai', 'tasks'));
+  try { fs.mkdirSync(job, { mode: 0o700 }); }
+  catch (e) { if (e.code === 'EEXIST') return reuseRequest(job, requestId, fingerprint, wait); throw e; }
+  const s = { schema: 1, id, job, project, worker, mode, model, effort, provider: o.provider, selectionReason, transport, timeout, entry,
+    host, readScope, readTargets, destination, preparedRef: o['prepared-ref'], taskContract: selected.taskContract,
+    reworkCount: (orig.reworkCount || 0) + (resume.reviewFeedback.length ? 1 : 0),
+    requestId, requestFingerprint: fingerprint, launcherPid: process.pid,
+    resume, continuationOf: orig.id, previousJob: origDir,
+    status: 'queued', createdAt: Date.now(), updatedAt: Date.now(), runnerPid: null, childPid: null };
+  await launch(job, s, task);
+  if (wait) await waitFor(job, wait);
+  output({ ...brief(getState(job)), reused: false, continuedFrom: origDir, resumeMode: resume.mode });
 }
 async function waitFor(dir, duration) {
   const until = Date.now() + duration * 1000;
@@ -335,16 +467,63 @@ function acceptResult(s, result) {
   if (result.jobId && result.jobId !== s.id) throw new Error('Result does not match this job');
   s.sessionId = result.sessionId || null;
   s.selectedModel = result.model || null; s.providerLabel = result.providerLabel || null;
+  s.effortEvidence = result.effortEvidence || null;
   s.usage = result.usage || null; s.projection = result.projection || null;
   s.notes = result.notes || [];
+  if (s.effortEvidence?.requested !== undefined && s.effortEvidence.requested !== s.effort) s.notes.push('Adapter reasoning request differs from the dispatched effort.');
+  if (s.effort !== 'provider-default' && s.effortEvidence?.runtimeConfirmed && s.effortEvidence.runtimeConfirmed !== s.effort) s.notes.push('Runtime confirmed a different reasoning effort.');
   s.status = /error|fail|cancel|permission|blocked/i.test(result.projection?.status || '') ? 'needs_attention' : 'ready_for_review';
+  if (s.notes.length) s.status = 'needs_attention';
   s.error = s.status === 'needs_attention' ? s.notes.join('; ') || 'Worker reported an incomplete or failed task.' : null;
   const response = redact(result.response);
   atomic(path.join(s.job, 'result.md'), response.slice(0, 12000) + (response.length > 12000 ? '\n\n[Summary truncated; full response is in adapter-result.json or output.json.]\n' : '\n') + (s.notes.length ? '\nBlockers: ' + s.notes.join('; ') + '\n' : ''));
 }
+function readReview(s) {
+  const file = path.join(s.job, 'review.json');
+  if (!exists(file)) return null;
+  if (fs.lstatSync(file).isSymbolicLink()) throw new Error('Invalid review record');
+  const review = readJSON(file);
+  if (review.schema !== 1 || review.jobId !== s.id || review.contractFingerprint !== hash(JSON.stringify(s.taskContract))) throw new Error('Review record does not match the job contract');
+  return review.resultFingerprint === reviewResultFingerprint(s) ? review : { ...review, recordedStatus: review.status, status: 'stale' };
+}
+function reviewResultFingerprint(s) {
+  const file = path.join(s.job, 'result.md');
+  return hash(JSON.stringify({ status: s.status, summary: exists(file) ? fs.readFileSync(file, 'utf8') : null,
+    selectedModel: s.selectedModel || null, effortEvidence: s.effortEvidence || null }));
+}
+function recordReview(dir, o) {
+  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(o['review-id'] || '') || !o['review-file']) throw new Error('review requires --review-id and --review-file containing criterion checks');
+  const s = getState(dir);
+  if (ACTIVE.has(s.status) || alive(s.runnerPid) || alive(s.childPid) || groupAlive(s.childPid)) throw new Error('Review requires an ended job with no surviving worker or supervisor');
+  if (s.host !== hostName()) throw new Error('Only the dispatching host may record this review');
+  const checks = reviewChecks(s.taskContract, readJSON(o['review-file']));
+  const status = checks.some(c => c.status === 'failed') ? 'changes_requested' : checks.some(c => c.status === 'unverified') ? 'incomplete' : 'accepted';
+  if (status === 'accepted' && s.status !== 'ready_for_review') throw new Error('Only ready_for_review jobs can be accepted; inspect worker errors first');
+  const record = { schema: 1, id: o['review-id'], jobId: s.id, host: s.host,
+    contractFingerprint: hash(JSON.stringify(s.taskContract)), resultFingerprint: reviewResultFingerprint(s), status,
+    checks: checks.map(c => ({ ...c, evidence: redact(c.evidence) })), reviewedAt: new Date().toISOString() };
+  record.fingerprint = hash(JSON.stringify({ jobId: record.jobId, host: record.host, contract: record.contractFingerprint, result: record.resultFingerprint, checks: record.checks }));
+  const reviews = path.join(dir, 'reviews'); directory(reviews);
+  const file = path.join(reviews, hash(record.id) + '.json');
+  const tmp = file + '.' + randomBytes(6).toString('hex') + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(record, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+  let reused = false, saved = record;
+  try { fs.linkSync(tmp, file); }
+  catch (e) {
+    if (e.code !== 'EEXIST') throw e;
+    if (fs.lstatSync(file).isSymbolicLink()) throw new Error('Invalid review record');
+    saved = readJSON(file);
+    if (saved.fingerprint !== record.fingerprint) throw new Error('review_id conflicts with an existing review; use a fresh ID for intentional re-review');
+    reused = true;
+  } finally { fs.unlinkSync(tmp); }
+  // A retry of an older review never replaces a newer acceptance decision.
+  const latest = readReview(s);
+  if (!reused || !latest || saved.reviewedAt > latest.reviewedAt) atomic(path.join(dir, 'review.json'), saved);
+  return output({ ...brief(s), recordedReview: saved, reused });
+}
 async function run(dir) {
   let s = readJSON(path.join(dir, 'state.json'));
-  let child, timer, heartbeat, killTimer, reason, total = 0;
+  let child, timer, heartbeat, killTimer, reason, total = 0, lastCheckpointAt = 0;
   const events = fs.openSync(path.join(dir, 'events.jsonl'), 'a', 0o600);
   const stdout = fs.openSync(path.join(dir, 'output.json'), 'w', 0o600);
   const stderr = fs.openSync(path.join(dir, 'stderr.log'), 'w', 0o600);
@@ -366,7 +545,7 @@ async function run(dir) {
     if (exists(path.join(dir, 'cancel.request'))) { reason = 'cancelled'; throw new Error('Cancelled before startup'); }
     if (s.readTargets && JSON.stringify(s.readTargets) !== JSON.stringify(scopeTargets(s.project, s.readScope))) throw new Error('Read scope targets changed before worker startup; prepare again.');
     if (s.destination) {
-      const actual = await destinationFor(s.worker, s.provider, s.worker === 'zcode' ? workerEnv(s.entry) : process.env);
+      const actual = await destinationFor(s.worker, s.provider, s.worker === 'zcode' ? workerEnv(s.entry) : process.env, s.project);
       if (actual.endpoint !== s.destination.endpoint) throw new Error('Inference destination changed before worker startup; prepare again.');
     }
     const prompt = promptFor(s);
@@ -374,20 +553,36 @@ async function run(dir) {
     const argv = [s.entry, '--cwd', s.project, '--mode', s.mode, '--json', '--no-color', '--surface', 'terminal',
       '--disallowed-tools', 'Agent,Task,TaskCreate,TaskUpdate,TaskList,TaskGet', '--prompt', prompt];
     if (process.env.ZCODE_WORKER_DEBUG === '1') argv.push('--verbose');
-    const adapter = { 'app-server': 'zcode-protocol.mjs', claude: 'claude-adapter.mjs', hermes: 'hermes-adapter.py' }[s.transport];
-    const command = adapter ? [path.join(path.dirname(SELF), adapter), dir] : argv;
+    const adapter = { 'app-server': 'zcode-protocol.mjs', claude: 'claude-adapter.mjs', codex: 'codex-adapter.mjs', hermes: 'hermes-adapter.py' }[s.transport];
+    const resumeArgs = s.resume?.mode === 'native' && s.resume.sessionId && ['app-server', 'codex'].includes(s.transport)
+      ? ['--resume', s.resume.sessionId] : [];
+    const command = adapter ? [path.join(path.dirname(SELF), adapter), dir, ...resumeArgs] : argv;
     child = spawn(s.worker === 'hermes' ? s.entry : process.execPath, command, { cwd: s.project, detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: s.worker === 'zcode' || !s.worker ? workerEnv(s.entry) : { ...process.env, NO_COLOR: '1' } });
-    s.childPid = child.pid || null; save(); event({ type: 'started', mode: s.mode, childPid: s.childPid, entry: s.entry });
+    s.childPid = child.pid || null; save(); event({ type: 'started', mode: s.mode, childPid: s.childPid, entry: s.entry, resume: s.resume || null });
     const capture = fd => chunk => {
       total += chunk.length;
       if (total <= LIMIT) fs.writeSync(fd, chunk);
       else stop('output_limit');
     };
     child.stdout.on('data', capture(stdout)); child.stderr.on('data', capture(stderr));
-    timer = setTimeout(() => stop('timed_out'), s.timeout * 1000);
+    // Only an explicitly supplied positive budget creates a total-time deadline;
+    // default execution has none, so long turns are never killed on the clock.
+    if (s.timeout) {
+      const deadline = Date.now() + s.timeout * 1000;
+      const arm = () => {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) stop('timed_out');
+        else timer = setTimeout(arm, Math.min(remaining, 2147483647));
+      };
+      arm();
+    }
     heartbeat = setInterval(() => {
       if (exists(path.join(dir, 'cancel.request'))) stop('cancelled');
       save();
+      if (Date.now() - lastCheckpointAt > 60000) {
+        lastCheckpointAt = Date.now();
+        try { writeCheckpoint(dir, s); } catch {} // Checkpointing is bookkeeping, never task activity.
+      }
     }, 500);
     const exit = await new Promise((resolve, reject) => {
       child.once('error', reject);
@@ -412,7 +607,10 @@ async function run(dir) {
     // Clean up descendants after exit/cancellation; the child has a dedicated process group.
     signalGroup('SIGKILL');
     process.off('SIGTERM', interrupted); process.off('SIGINT', interrupted);
-    s.finishedAt = Date.now(); save();
+    s.finishedAt = Date.now();
+    // Publish terminal state only after its final checkpoint is durable.
+    try { writeCheckpoint(dir, s); } catch { s.checkpointError = 'Checkpoint could not be saved; continuation is unavailable.'; }
+    save();
     for (const fd of [stdout, stderr, events]) fs.closeSync(fd);
     release(s);
   }
@@ -421,12 +619,15 @@ async function main() {
   const o = args(process.argv.slice(2));
   if (o.command === 'help') return output({ commands: {
     workers: '(list installed worker runtimes)',
-    models: '--worker zcode|claude|hermes --project DIR (model catalog; no inference prompt)',
-    prepare: '--worker WORKER --project DIR --task-file FILE --provider ID --model MODEL --effort LEVEL [--read-scope JSON] [--mode plan|edit] (local destination preview; no inference)',
-    submit: 'Same selection as prepare, plus --prepared-ref REF --endpoint URL [--request-id ID] [--selection-reason TEXT] [--timeout 600] [--wait 1..55]. Host authorization is required.',
-    status: '--job DIR [--wait 1..55]', result: '--job DIR', collect: '--job DIR (recover an existing saved adapter result without model calls)', cancel: '--job DIR' },
-    note: 'One worker per project across all adapters. ready_for_review means worker returned, not acceptance passed. Each worker reuses its own configured provider.' });
+    models: '--worker zcode|claude|codex|hermes --project DIR (model catalog; no inference prompt)',
+    prepare: '--worker WORKER --project DIR --task-file FILE --provider ID --model MODEL --effort LEVEL [--task-contract-file JSON_FILE] [--read-scope JSON] [--mode plan|edit] (local destination preview; no inference; 30-minute binding for submission only)',
+    submit: 'Same selection as prepare, plus --prepared-ref REF --endpoint URL [--request-id ID] [--selection-reason TEXT] [--timeout SECONDS] [--wait 1..55]. Host authorization is required. Omit --timeout for no total-time deadline; a supplied positive budget is enforced and may exceed one hour.',
+    continue: 'After an ended job: --job OLD_DIR plus a fresh preparation (--prepared-ref/--endpoint), fresh --request-id, unchanged selection and a continuation --task-file. Refuses while the old supervisor/worker lives; uses native resume where supported and clearly labels checkpoint-based continuation.',
+    review: '--job DIR --review-id ID --review-file JSON_FILE (host-recorded evidence for every criterion; no inference; only all-passed required verification kinds can be accepted)',
+    status: '--job DIR [--wait 1..55]', result: '--job DIR', collect: '--job DIR (recover an existing saved adapter result without model calls; does not resume execution)', cancel: '--job DIR' },
+    note: 'One worker per project across all adapters. ready_for_review means worker returned, not acceptance passed. Each worker reuses its own configured provider. Preparation expiry blocks new dispatch only; running jobs, status reads and checkpoints are unaffected. Token/usage counters are not money or quota.' });
   if (o.command === 'submit') return submit(o);
+  if (o.command === 'continue') return continueJob(o);
   if (o.command === 'prepare') return prepare(o);
   if (o.command === 'workers') return output({ host: hostName(), workers: workers() });
   if (o.command === 'models') {
@@ -435,13 +636,14 @@ async function main() {
     if (!fs.statSync(project).isDirectory()) throw new Error('Project is not a directory');
     const worker = o.worker || 'zcode';
     if (!WORKERS.includes(worker)) throw new Error('Unknown worker: ' + worker);
-    const adapter = { zcode: 'zcode-protocol.mjs', claude: 'claude-adapter.mjs', hermes: 'hermes-adapter.py' }[worker];
+    const adapter = { zcode: 'zcode-protocol.mjs', claude: 'claude-adapter.mjs', codex: 'codex-adapter.mjs', hermes: 'hermes-adapter.py' }[worker];
     const { stdout } = await promisify(execFile)(worker === 'hermes' ? entryFor(worker) : process.execPath, [path.join(path.dirname(SELF), adapter), '--models', project], { timeout: 45000, maxBuffer: 1024 * 1024 });
-    return output(JSON.parse(stdout));
+    return output(catalogGuidance(JSON.parse(stdout)));
   }
-  if (!['_run', 'status', 'result', 'collect', 'cancel'].includes(o.command)) throw new Error('Unknown command: ' + o.command);
+  if (!['_run', 'status', 'result', 'review', 'collect', 'cancel'].includes(o.command)) throw new Error('Unknown command: ' + o.command);
   const dir = jobDir(o.job);
   if (o.command === '_run') return run(dir);
+  if (o.command === 'review') return recordReview(dir, o);
   if (o.command === 'collect') {
     const s = getState(dir);
     if (s.transport === 'prompt' || ACTIVE.has(s.status)) throw new Error('collect requires an ended adapter job');
@@ -465,7 +667,7 @@ async function main() {
   }
   if (o.wait !== undefined) await waitFor(dir, seconds(o.wait, 1, 55));
   const s = getState(dir);
-  if (o.command === 'result') return output({ ...brief(s), summary: exists(path.join(dir, 'result.md')) ? fs.readFileSync(path.join(dir, 'result.md'), 'utf8') : null });
+  if (o.command === 'result') return output({ ...brief(s), review: readReview(s), summary: exists(path.join(dir, 'result.md')) ? fs.readFileSync(path.join(dir, 'result.md'), 'utf8') : null });
   output(brief(s));
 }
 if (process.argv[1] && path.resolve(process.argv[1]) === SELF) {

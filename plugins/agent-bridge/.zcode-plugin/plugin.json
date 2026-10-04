@@ -1,7 +1,7 @@
 {
   "name": "agent-bridge",
-  "version": "0.2.1",
-  "description": "Let the current host agent dispatch scoped tasks to Z Code, Claude Code and Hermes, with explicit models and destination preflight.",
+  "version": "0.2.3",
+  "description": "Quality-first host-led task dispatch with explicit models, structured handoff, destination preflight and recorded independent acceptance.",
   "author": {
     "name": "Henry"
   },

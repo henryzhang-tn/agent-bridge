@@ -1,5 +1,6 @@
 // Persist compact activity metadata separately from the supervisor's heartbeat.
-// Never persist stream text, tool inputs/outputs, or permission request contents.
+// Shared by every worker adapter; never persist stream text, tool inputs/outputs,
+// or permission request contents.
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -7,10 +8,11 @@ import { randomBytes } from 'node:crypto';
 const identifier = value => typeof value === 'string' && /^[A-Za-z0-9_.:/-]{1,200}$/.test(value) ? value : null;
 const count = value => Number.isFinite(value) && value >= 0 ? value : undefined;
 const phases = new Set(['starting', 'waiting_for_model', 'reasoning', 'responding', 'preparing_tool', 'tools', 'blocked', 'collecting', 'completed', 'failed']);
+export const PROGRESS_SOURCES = ['zcode-session-events', 'codex-app-server', 'claude-cli', 'hermes-runtime'];
 
-export function createProgressTracker(job, { now = Date.now, intervalMs = 1000 } = {}) {
+export function createProgressTracker(job, { source = 'zcode-session-events', worker = 'zcode', now = Date.now, intervalMs = 1000, reportIntervalMs = 30000 } = {}) {
   const file = path.join(job, 'progress.json');
-  const data = { schema: 1, jobId: path.basename(job), source: 'zcode-session-events', monitoring: 'starting',
+  const data = { schema: 1, jobId: path.basename(job), source, worker, monitoring: 'starting',
     sessionId: null, selectedModel: null, phase: 'starting', lastActivityAt: null, lastActivity: null,
     reasoningCharacters: 0, responseCharacters: 0, hostInteractionRequired: false };
   const calls = new Map(), interactions = new Set();
@@ -26,7 +28,7 @@ export function createProgressTracker(job, { now = Date.now, intervalMs = 1000 }
       if (active(call)) { tools.active++; if (tools.current.length < 20) tools.current.push({ ...call }); }
       else { tools[call.status]++; stats[call.status]++; }
     }
-    return { ...data, pendingInteractions: interactions.size, tools };
+    return { ...data, reportedAt: timestamp(), pendingInteractions: interactions.size, tools };
   }
   function flush() {
     clearTimeout(timer); timer = undefined;
@@ -94,6 +96,10 @@ export function createProgressTracker(job, { now = Date.now, intervalMs = 1000 }
       phase('waiting_for_model'); touch(event.type); save(true);
     }
   }
+  // Reporting is adapter liveness, not runtime/task activity. Keep timestamps
+  // separate so a live reporter cannot hide a silent model or stuck tool.
+  const reporter = setInterval(() => save(true), reportIntervalMs);
+  reporter.unref();
   return {
     bindSession(sessionId) { data.sessionId = sessionId; touch('session_ready'); save(true); },
     selectModel(model) { data.selectedModel = model; touch('selected_model'); save(true); },
@@ -106,16 +112,76 @@ export function createProgressTracker(job, { now = Date.now, intervalMs = 1000 }
       data.hostInteractionRequired = true; phase('blocked');
       touch('interaction_blocked', identifier(method)); save(true);
     },
-    finish(failed = false) { data.phase = failed ? 'failed' : 'completed'; touch(failed ? 'adapter_error' : 'result_written'); save(true); },
-    observe, snapshot, close: flush,
+    interactionResolved() {
+      data.hostInteractionRequired = false;
+      phase([...calls.values()].some(active) ? 'tools' : 'waiting_for_model');
+      save(true);
+    },
+    activity(type, kind, toolName) { touch(type, kind, toolName); save(true); },
+    phase(value) { if (phases.has(value)) { phase(value); save(true); } },
+    finish(failed = false) {
+      // A pending host interaction remains visible even at the end: it explains
+      // why the task cannot progress without the host.
+      data.phase = data.hostInteractionRequired || interactions.size ? 'blocked' : failed ? 'failed' : 'completed';
+      touch(failed ? 'adapter_error' : 'result_written'); save(true);
+    },
+    // Codex app-server item lifecycle: one item id is one tool call observation.
+    toolStarted(id, name) {
+      const key = identifier(id);
+      if (!key) return;
+      const call = calls.get(key);
+      if (call && !active(call)) return;
+      calls.set(key, { ...call, id: key, name: identifier(name) || call?.name || 'unknown', status: 'running', startedAt: call?.startedAt || timestamp(), lastActivityAt: timestamp() });
+      phase('tools'); touch('tool_started', undefined, identifier(name)); save(true);
+    },
+    toolFinished(id, name, failed) {
+      const key = identifier(id);
+      if (!key) return;
+      const call = calls.get(key) || { id: key, name: identifier(name) || 'unknown', status: 'running', startedAt: timestamp() };
+      if (!active(call)) return;
+      call.status = failed ? 'failed' : 'completed';
+      call.lastActivityAt = timestamp();
+      calls.set(key, call);
+      lastCompleted = { ...call };
+      phase([...calls.values()].some(active) ? 'tools' : 'waiting_for_model');
+      touch(failed ? 'tool_failed' : 'tool_completed', undefined, call.name); save(true);
+    },
+    streaming(kind, characters = 0) {
+      if (kind === 'reasoning') { phase('reasoning'); if (characters > 0) data.reasoningCharacters += characters; }
+      else if (kind === 'response') { phase('responding'); if (characters > 0) data.responseCharacters += characters; }
+      else return;
+      touch('model_streaming', kind); save();
+    },
+    report() { save(true); }, observe, snapshot,
+    close() { clearInterval(reporter); flush(); },
   };
+}
+
+// Advisory only: never triggers cancellation. Missing telemetry is unknown,
+// never proof of a stall.
+function assess(p, idleSeconds) {
+  const base = { advisory: true, automaticAction: 'none' };
+  if (p.hostInteractionRequired || p.pendingInteractions > 0) return { ...base, activity: 'blocked',
+    attention: 'host_interaction_required', suspectedStall: false,
+    note: 'The worker is waiting for a host/user interaction; agent-bridge never approves automatically.' };
+  if (p.monitoring !== 'subscribed') return { ...base, activity: 'unknown', suspectedStall: null,
+    note: 'Runtime telemetry is missing or unsupported for this worker; silence is not evidence of a stall.' };
+  if (idleSeconds === null) return { ...base, activity: 'unknown', suspectedStall: null,
+    note: 'No runtime activity timestamp has been observed yet.' };
+  if (p.tools.active > 0) return { ...base, activity: 'active', suspectedStall: false,
+    note: p.tools.active + ' tool call(s) currently running.' };
+  if (idleSeconds <= 120) return { ...base, activity: 'active', suspectedStall: false,
+    note: 'Recent runtime activity observed.' };
+  return { ...base, activity: 'idle', suspectedStall: true,
+    note: 'No runtime activity for ' + idleSeconds + 's (advisory only). Jobs are never killed on silence; verify with the worker and host before cancelling.' };
 }
 
 export function readProgress(job, now = Date.now()) {
   try {
     const p = JSON.parse(fs.readFileSync(path.join(job, 'progress.json'), 'utf8'));
-    if (p.schema !== 1 || p.jobId !== path.basename(job) || p.source !== 'zcode-session-events' || !phases.has(p.phase)) return null;
+    if (p.schema !== 1 || p.jobId !== path.basename(job) || !PROGRESS_SOURCES.includes(p.source) || !phases.has(p.phase)) return null;
     const at = Date.parse(p.lastActivityAt);
-    return { ...p, idleSeconds: Number.isFinite(at) ? Math.max(0, Math.floor((now - at) / 1000)) : null };
+    const idleSeconds = Number.isFinite(at) ? Math.max(0, Math.floor((now - at) / 1000)) : null;
+    return { ...p, idleSeconds, assessment: assess(p, idleSeconds) };
   } catch { return null; } // Old jobs and other adapters may have no progress file.
 }

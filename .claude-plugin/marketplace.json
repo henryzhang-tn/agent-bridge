@@ -1,5 +1,5 @@
 {
   "name": "agent-bridge",
   "owner": { "name": "Henry" },
-  "plugins": [{ "name": "agent-bridge", "source": "./plugins/agent-bridge", "version": "0.2.1", "description": "Host-led multi-worker task dispatch with destination preflight." }]
+  "plugins": [{ "name": "agent-bridge", "source": "./plugins/agent-bridge", "version": "0.2.3", "description": "Quality-first task dispatch with structured handoff and recorded acceptance." }]
 }

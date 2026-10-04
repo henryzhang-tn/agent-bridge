@@ -19,10 +19,10 @@ write('.mcp.json', { mcpServers: { agent_bridge: server('generic') } });
 write('mcp.json', { $schema: 'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json',
   mcpServers: { agent_bridge: { type: 'stdio', command: './scripts/launch-mcp', env: { AGENT_BRIDGE_HOST: 'codex' } } } });
 write('.codex-plugin/plugin.json', { ...metadata, skills: './skills/', mcpServers: './mcp/codex.json', interface: {
-  displayName: 'Agent Bridge', shortDescription: '当前宿主调度 Z Code、Claude Code、Hermes，明确模型和发送范围。',
-  longDescription: 'Host-led worker selection, destination preflight, async execution and independent acceptance.',
+  displayName: 'Agent Bridge', shortDescription: '质量优先调度，明确任务标准、推理配置并记录独立验收。',
+  longDescription: 'Quality-first worker selection, structured handoff, destination preflight, async execution and recorded independent acceptance.',
   developerName: metadata.author.name, category: 'Productivity', capabilities: ['Read', 'Write'],
-  defaultPrompt: '使用 Agent Bridge 完成任务，由当前宿主选择 worker 和模型，核对目的地授权后执行并验收。' } });
+  defaultPrompt: '使用 Agent Bridge 按质量优先规则完成任务，提供 task_contract，核对目的地授权后执行，独立验证并记录验收。' } });
 for (const host of ['claude', 'zcode']) write(`.${host}-plugin/plugin.json`, {
   ...metadata, skills: './skills/', mcpServers: { agent_bridge: server(host) },
 });

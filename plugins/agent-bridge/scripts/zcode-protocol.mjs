@@ -6,6 +6,7 @@ import readline from 'node:readline';
 import { workerEnv } from './bridge.mjs';
 import { zcodeDestination } from './destination.mjs';
 import { createProgressTracker } from './zcode-progress.mjs';
+import { effortEvidence } from './quality.mjs';
 
 const catalogOnly = process.argv[2] === '--models';
 const job = catalogOnly ? null : process.argv[2];
@@ -36,7 +37,9 @@ function request(method, params, timeout = 30000) {
   if (fatal) return Promise.reject(fatal);
   const id = ++nextId;
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { pending.delete(id); reject(new Error(method + ' timed out')); }, timeout);
+    // timeout === null disables the internal timer: a running prompt is bounded
+    // only by an explicit task budget or cancellation, not by a control-RPC limit.
+    const timer = timeout === null ? undefined : setTimeout(() => { pending.delete(id); reject(new Error(method + ' timed out')); }, timeout);
     pending.set(id, { resolve, reject, timer });
     send({ id, method, params });
   });
@@ -60,7 +63,7 @@ readline.createInterface({ input: child.stdout }).on('line', line => {
     } else if (msg.id !== undefined) {
       const p = pending.get(msg.id);
       if (!p) return;
-      pending.delete(msg.id); clearTimeout(p.timer);
+      pending.delete(msg.id); if (p.timer) clearTimeout(p.timer);
       if (msg.error) p.reject(Object.assign(new Error(msg.error.message), { code: msg.error.code })); else p.resolve(msg.result);
     } else if (msg.method === 'session/event') {
       progress?.observe(msg.params || {});
@@ -84,15 +87,17 @@ function textOf(message) {
 async function execute() {
   const tools = state.mode === 'plan' ? ['Read', 'Glob', 'Grep'] : ['Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash'];
   const collectSession = process.argv[3] === '--collect' ? process.argv[4] : null;
-  const initial = await request(collectSession ? 'session/resume' : 'session/create', {
+  const resumeSession = process.argv[3] === '--resume' ? process.argv[4] : null;
+  const reopened = collectSession || resumeSession;
+  const initial = await request(reopened ? 'session/resume' : 'session/create', {
     workspace: { workspacePath: state.project, workspaceKey: state.project },
-    ...(collectSession ? { sessionId: collectSession } : { mode: state.mode, titleGenerationEnabled: false }),
+    ...(reopened ? { sessionId: reopened } : { mode: state.mode, titleGenerationEnabled: false }),
     mcpServers: [], toolAllowlist: tools,
     offPeakToolEnabled: false, dynamicWorkflowEnabled: false,
   });
   sessionId = initial.session?.sessionId;
   if (!sessionId) throw new Error('app-server returned no session ID');
-  log({ type: 'session_ready', sessionId, collectOnly: !!collectSession });
+  log({ type: 'session_ready', sessionId, collectOnly: !!collectSession, resumed: !!resumeSession });
   progress?.bindSession(sessionId);
   const available = initial.settings?.model?.available || [];
   const currentProvider = initial.settings?.model?.current?.providerId;
@@ -110,10 +115,13 @@ async function execute() {
   if (!selected) throw new Error('Requested model is unavailable or provider is ambiguous: ' + state.model);
   if (!selected.reasoning?.levels?.some(x => x.value === state.effort)) throw new Error('Unsupported reasoning effort: ' + state.effort);
   const selection = { ...selected.ref, options: { reasoningLevel: state.effort } };
+  let runtimeConfirmed = null;
   if (collectSession) terminalReason = initial.session?.status === 'error' ? 'prompt_failed' : 'prompt_completed';
   else {
     if (state.destination && zcodeDestination(state.provider, workerEnv(state.entry)).endpoint !== state.destination.endpoint) throw new Error('Inference destination changed before sending the task; prepare again.');
-    await request('session/setModel', { sessionId, model: selection, persistAsWorkspaceLastUsed: false });
+    const acknowledged = await request('session/setModel', { sessionId, model: selection, persistAsWorkspaceLastUsed: false });
+    const echoed = acknowledged.settings?.model?.current;
+    if (echoed?.providerId === selection.providerId && echoed?.modelId === selection.modelId && typeof echoed.options?.reasoningLevel === 'string') runtimeConfirmed = echoed.options.reasoningLevel;
     log({ type: 'selected_model', sessionId, model: selection, providerLabel: selected.providerLabel });
     progress.selectModel(selection);
     // Without a deliveryKind subscription the app-server emits no session/event
@@ -128,8 +136,10 @@ async function execute() {
       progress.monitoring('unsupported');
       log({ type: 'progress_unavailable', reason: 'session_subscription_unsupported' });
     }
-    await request('session/send', { sessionId, content: prompt, modelSelection: selection }, state.timeout * 1000);
-    log({ type: 'send_acknowledged' });
+    // The prompt request stays open as long as the turn runs; the supervisor's
+    // explicit task budget (or cancellation) bounds it, so no internal timer.
+    await request('session/send', { sessionId, content: prompt, modelSelection: selection }, null);
+    log({ type: 'send_acknowledged', resumed: !!resumeSession });
   }
   while (!terminalReason) {
     if (fatal) throw fatal;
@@ -145,6 +155,9 @@ async function execute() {
   const error = terminalReason === 'prompt_failed' || notes.length > 0;
   const result = { sessionId, response: response || notes.join('\n') || 'Worker returned without a final text response.',
     usage, model: selection, providerLabel: selected.providerLabel,
+    effortEvidence: effortEvidence(state, { parameter: 'session/send.modelSelection.options.reasoningLevel',
+      supportedLevels: selected.reasoning.levels.map(x => x.value), runtimeConfirmed,
+      confirmationSource: runtimeConfirmed ? 'session/setModel.settings.model.current' : null }),
     projection: { ...snapshot.projection, status: error || !response ? 'error' : snapshot.projection?.status || 'idle' }, notes };
   fs.writeFileSync(job + '/adapter-result.json', JSON.stringify(result), { mode: 0o600 });
   fs.writeSync(1, JSON.stringify(result) + '\n');

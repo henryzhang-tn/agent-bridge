@@ -8,6 +8,151 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const server = fileURLToPath(new URL('../plugins/agent-bridge/scripts/mcp-server.mjs', import.meta.url));
+const qualityContract = () => ({ complexity: 'complex', context: 'Synthetic fixture only; no private source.', allowed_edits: [],
+  preserve: ['Preserve the fixture.'], integration: 'Host independently inspects the result and runs a synthetic runtime scenario.',
+  acceptance_criteria: [
+    { id: 'implementation', description: 'Return the requested model result.', verification: 'Inspect the actual result.', verification_kind: 'source' },
+    { id: 'runtime', description: 'The application scenario works.', verification: 'Run the synthetic scenario.', verification_kind: 'runtime' },
+  ] });
+const reviewChecks = () => [
+  { criterion_id: 'implementation', status: 'passed', evidence: 'Host inspected the synthetic result.', verification_kind: 'source' },
+  { criterion_id: 'runtime', status: 'passed', evidence: 'Host ran the synthetic application scenario.', verification_kind: 'runtime' },
+];
+
+test('structured tasks bind criteria to preflight and expose pending acceptance and reasoning provenance', async t => {
+  const f = fixture(t), contract = qualityContract();
+  const selected = { ...f.args, task_contract: contract };
+  const prepared = (await f.call('prepare_dispatch', selected)).structuredContent;
+  assert.equal(prepared.quality.contract, 'structured');
+  const changed = { ...contract, integration: 'Different responsibility.' };
+  const refused = await f.call('dispatch_task', { ...selected, task_contract: changed, prepared_ref: prepared.preparedRef, endpoint: prepared.destination.endpoint });
+  assert.equal(refused.isError, true); assert.match(refused.content[0].text, /changed since preparation/);
+  assert.equal(f.requestLog().length, 0);
+  const submitted = await f.dispatch({ task_contract: contract });
+  const job = submitted.structuredContent.job;
+  const finished = (await f.call('task_status', { job, wait_seconds: 3 })).structuredContent;
+  assert.equal(finished.quality.acceptanceStatus, 'pending');
+  assert.equal(finished.effortEvidence.requested, 'high');
+  assert.equal(finished.effortEvidence.sentToRuntime, 'high');
+  assert.equal(finished.effortEvidence.runtimeConfirmed, 'high');
+  assert.equal(finished.effortEvidence.providerConfirmed, null);
+  assert.equal(finished.quality.recommendedEffort, 'max');
+  assert.ok(finished.quality.warnings.some(w => w.startsWith('complex_task_below')));
+  assert.equal(finished.effort, 'high', 'explicit selection is never overridden');
+  assert.deepEqual(finished.taskContract.acceptance_criteria, contract.acceptance_criteria);
+});
+
+test('host acceptance requires complete independent evidence, preserves history and never runs inference', async t => {
+  const f = fixture(t);
+  const job = (await f.dispatch({ task_contract: qualityContract() })).structuredContent.job;
+  await f.call('task_status', { job, wait_seconds: 3 });
+  const before = f.requestLog().length;
+  for (const checks of [reviewChecks().slice(0, 1), [reviewChecks()[0], reviewChecks()[0]],
+    [reviewChecks()[0], { ...reviewChecks()[1], criterion_id: 'unknown' }],
+    [reviewChecks()[0], { ...reviewChecks()[1], verification_kind: 'test' }]]) {
+    const refused = await f.call('record_review', { job, review_id: 'bad-review', checks });
+    assert.equal(refused.isError, true);
+  }
+  const unverified = [reviewChecks()[0], { ...reviewChecks()[1], status: 'unverified', evidence: 'Real runtime has not been exercised.' }];
+  const incomplete = (await f.call('record_review', { job, review_id: 'review-1', checks: unverified })).structuredContent;
+  assert.equal(incomplete.quality.acceptanceStatus, 'incomplete');
+  assert.equal(incomplete.status, 'ready_for_review', 'execution and acceptance remain separate');
+  const failed = [reviewChecks()[0], { ...reviewChecks()[1], status: 'failed', evidence: 'Synthetic scenario failed; api_key=synthetic-do-not-save' }];
+  const rejected = (await f.call('record_review', { job, review_id: 'review-2', checks: failed })).structuredContent;
+  assert.equal(rejected.quality.acceptanceStatus, 'changes_requested');
+  assert.ok(!JSON.stringify(rejected).includes('synthetic-do-not-save'));
+  const concurrent = await Promise.all([1, 2].map(() => f.call('record_review', { job, review_id: 'review-3', checks: reviewChecks() })));
+  assert.ok(concurrent.every(r => !r.isError));
+  assert.equal(concurrent.filter(r => r.structuredContent.reused).length, 1);
+  const accepted = concurrent[0].structuredContent;
+  assert.equal(accepted.quality.acceptanceStatus, 'accepted');
+  assert.equal(accepted.recordedReview.host, 'claude');
+  const retry = (await f.call('record_review', { job, review_id: 'review-1', checks: unverified })).structuredContent;
+  assert.equal(retry.reused, true);
+  assert.equal(retry.quality.acceptanceStatus, 'accepted', 'old retry does not undo a newer review');
+  assert.equal((await f.call('record_review', { job, review_id: 'review-3', checks: failed })).isError, true);
+  assert.equal(fs.readdirSync(path.join(job, 'reviews')).length, 3);
+  assert.equal(fs.statSync(path.join(job, 'review.json')).mode & 0o777, 0o600);
+  const result = (await f.call('task_result', { job })).structuredContent;
+  assert.equal(result.review.checks.length, 2);
+  assert.equal(f.requestLog().length, before);
+  fs.appendFileSync(path.join(job, 'result.md'), '\nChanged saved result.');
+  const stale = (await f.call('task_status', { job })).structuredContent;
+  assert.equal(stale.quality.acceptanceStatus, 'stale');
+});
+
+test('a runtime effort mismatch becomes needs_attention rather than an apparently successful result', async t => {
+  const f = fixture(t);
+  const job = (await f.dispatch()).structuredContent.job;
+  await f.call('task_status', { job, wait_seconds: 3 });
+  const file = path.join(job, 'adapter-result.json'), result = JSON.parse(fs.readFileSync(file));
+  result.effortEvidence.runtimeConfirmed = 'low';
+  fs.writeFileSync(file, JSON.stringify(result));
+  const recovered = (await f.call('recover_result', { job })).structuredContent;
+  assert.equal(recovered.status, 'needs_attention');
+  assert.match(recovered.error, /different reasoning effort/);
+});
+
+test('legacy, running, errored and wrong-host jobs cannot be falsely accepted', async t => {
+  const f = fixture(t);
+  const legacy = (await f.dispatch()).structuredContent.job;
+  const old = (await f.call('task_status', { job: legacy, wait_seconds: 3 })).structuredContent;
+  assert.equal(old.quality.acceptanceStatus, 'unstructured');
+  assert.equal((await f.call('record_review', { job: legacy, review_id: 'legacy', checks: reviewChecks() })).isError, true);
+  const job = (await f.dispatch({ task_contract: qualityContract() })).structuredContent.job;
+  await f.call('task_status', { job, wait_seconds: 3 });
+  const file = path.join(job, 'state.json'), state = JSON.parse(fs.readFileSync(file));
+  fs.writeFileSync(file, JSON.stringify({ ...state, status: 'needs_attention' }));
+  assert.equal((await f.call('record_review', { job, review_id: 'errored', checks: reviewChecks() })).isError, true);
+  fs.writeFileSync(file, JSON.stringify({ ...state, host: 'zcode' }));
+  const wrongHost = await f.call('record_review', { job, review_id: 'wrong-host', checks: reviewChecks() });
+  assert.equal(wrongHost.isError, true); assert.match(wrongHost.content[0].text, /dispatching host/);
+  fs.writeFileSync(file, JSON.stringify(state));
+  const live = (await f.dispatch({ task: 'PROGRESS_TEST', task_contract: qualityContract() })).structuredContent.job;
+  const blocked = await f.call('record_review', { job: live, review_id: 'running', checks: reviewChecks() });
+  assert.equal(blocked.isError, true); assert.match(blocked.content[0].text, /ended job/);
+});
+
+test('rework preserves criteria and passes only remaining host feedback into explicit continuations', async t => {
+  const f = fixture(t), contract = qualityContract();
+  let previous = (await f.dispatch({ task_contract: contract, request_id: 'quality-original' })).structuredContent;
+  await f.call('task_status', { job: previous.job, wait_seconds: 3 });
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const checks = [reviewChecks()[0], { ...reviewChecks()[1], status: 'failed', evidence: 'HOST_REWORK_SCENARIO_FAILED' }];
+    await f.call('record_review', { job: previous.job, review_id: 'failed-' + attempt, checks });
+    const selected = { ...f.args, task: 'Fix only the failed synthetic scenario and preserve passing behavior.', task_contract: contract };
+    const prepared = (await f.call('prepare_dispatch', selected)).structuredContent;
+    const continued = await f.call('continue_task', { ...selected, job: previous.job,
+      prepared_ref: prepared.preparedRef, endpoint: prepared.destination.endpoint, request_id: 'quality-rework-' + attempt });
+    assert.equal(continued.isError, false, continued.content[0].text);
+    previous = continued.structuredContent; f.jobs.push(previous.job);
+    const done = (await f.call('task_status', { job: previous.job, wait_seconds: 3 })).structuredContent;
+    assert.equal(done.quality.reworkCount, attempt);
+    assert.equal(done.quality.acceptanceStatus, 'pending');
+    const state = JSON.parse(fs.readFileSync(path.join(previous.job, 'state.json')));
+    assert.deepEqual(state.taskContract, contract);
+    assert.equal(state.resume.reviewFeedback.length, 1);
+    assert.equal(state.resume.reviewFeedback[0].criterion_id, 'runtime');
+    assert.match(fs.readFileSync(path.join(previous.job, 'prompt.md'), 'utf8'), /HOST_REWORK_SCENARIO_FAILED/);
+    if (attempt === 2) assert.ok(done.quality.warnings.some(w => w.startsWith('repeated_rework')));
+  }
+  const changed = { ...f.args, task: 'Drop a criterion.', task_contract: { ...contract, acceptance_criteria: contract.acceptance_criteria.slice(0, 1) } };
+  const prepared = (await f.call('prepare_dispatch', changed)).structuredContent;
+  const refused = await f.call('continue_task', { ...changed, job: previous.job,
+    prepared_ref: prepared.preparedRef, endpoint: prepared.destination.endpoint, request_id: 'quality-loosen' });
+  assert.equal(refused.isError, true); assert.match(refused.content[0].text, /preserve the original task_contract/);
+  assert.equal(f.requestLog().filter(x => x.method === 'session/send').length, 3);
+});
+
+test('malformed task contracts are refused before preparation and worker startup', async t => {
+  const f = fixture(t);
+  for (const task_contract of [{}, { ...qualityContract(), allowed_edits: ['new-file'] },
+    { ...qualityContract(), acceptance_criteria: [] }, { ...qualityContract(), unknown: true }]) {
+    const r = await f.dispatch({ task_contract }); assert.equal(r.isError, true);
+  }
+  assert.equal(fs.existsSync(path.join(f.root, '.ai')), false);
+  assert.equal(f.requestLog().length, 0);
+});
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-mcp-'));
   const entry = path.join(root, 'fake-app-server.mjs');
@@ -21,6 +166,7 @@ const snapshot=()=>({session:{sessionId:'sess_fake',status:'idle'},settings:{mod
 readline.createInterface({input:process.stdin}).on('line',line=>{
  const m=JSON.parse(line);fs.appendFileSync('rpc.jsonl',JSON.stringify(m)+'\\n');
  if(m.method==='session/create')send({id:m.id,result:snapshot()});
+ else if(m.method==='session/resume')send({id:m.id,result:snapshot()});
  else if(m.method==='session/setModel'){selection=m.params.model;send({id:m.id,result:snapshot()});}
  else if(m.method==='session/subscribe')send(fs.existsSync('unsupported-subscription') ? {id:m.id,error:{code:-32601,message:'Method not found'}} : {id:m.id,result:{sessionId:'sess_fake',eventSeq:0,events:[]}});
  else if(m.method==='session/send'){
@@ -78,7 +224,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     if (r.structuredContent?.job) jobs.push(r.structuredContent.job);
     return r;
   };
-  return { root, rpc, call, requestLog, dispatch, args, config };
+  return { root, rpc, call, requestLog, dispatch, args, config, jobs };
 }
 
 test('MCP initialization, discovery and model catalog do not invoke inference', async t => {
@@ -230,6 +376,35 @@ test('preflight sends no inference and rejects changed destination, task, scope 
   assert.match((await f.call('dispatch_task', request)).content[0].text, /expired/);
   assert.equal(fs.existsSync(path.join(f.root, '.ai/tasks')), false);
   assert.equal(f.requestLog().length, 0);
+});
+
+test('MCP continue_task re-preflights and resumes natively after an ended job', async t => {
+  const f = fixture(t);
+  const first = (await f.dispatch({ request_id: 'mcp-cont-001' })).structuredContent;
+  assert.equal((await f.call('task_status', { job: first.job, wait_seconds: 5 })).structuredContent.status, 'ready_for_review');
+  const prepared = await f.call('prepare_dispatch', { ...f.args, task: 'Continue the synthetic fixture work only.' });
+  const continuation = { ...f.args, task: 'Continue the synthetic fixture work only.', job: first.job,
+    prepared_ref: prepared.structuredContent.preparedRef, endpoint: prepared.structuredContent.destination.endpoint, request_id: 'mcp-cont-002' };
+  for (const broken of [{ request_id: '../bad' }, { job: '/relative/path' }, { prepared_ref: '0'.repeat(31) }]) {
+    assert.equal((await f.call('continue_task', { ...continuation, ...broken })).isError, true);
+  }
+  const continued = await f.call('continue_task', continuation);
+  assert.equal(continued.isError, false, continued.content[0].text);
+  const r = continued.structuredContent;
+  f.jobs.push(r.job);
+  assert.equal(r.reused, false); assert.equal(r.resumeMode, 'native');
+  assert.equal(r.continuation.of, first.id);
+  assert.equal(r.continuation.previousSessionId, 'sess_fake');
+  const finished = await f.call('task_status', { job: r.job, wait_seconds: 5 });
+  assert.equal(finished.structuredContent.status, 'ready_for_review');
+  assert.ok(f.requestLog().some(x => x.method === 'session/resume'), 'native resume used the recorded session');
+  assert.equal(f.requestLog().filter(x => x.method === 'session/send').length, 2, 'one turn per dispatched task');
+  // Lost replies can be retried without starting another turn.
+  const replay = await f.call('continue_task', continuation);
+  assert.equal(replay.isError, false);
+  assert.equal(replay.structuredContent.reused, true);
+  assert.equal(replay.structuredContent.job, r.job);
+  assert.equal(f.requestLog().filter(x => x.method === 'session/send').length, 2);
 });
 
 test('scope symlink retargeting is blocked but replay of an existing job needs no surviving source file', async t => {

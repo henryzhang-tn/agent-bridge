@@ -6,6 +6,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { configuredClaude } from './claude-adapter.mjs';
 import { entryFor } from './workers.mjs';
+import { readCodexConfiguration, routingFromConfig } from './codex-config.mjs';
 
 export const HOSTS = ['codex', 'claude', 'zcode', 'hermes', 'generic'];
 export function hostName() {
@@ -47,12 +48,20 @@ export function zcodeDestination(provider, env) {
   return { provider, endpoint: endpoint(base) };
 }
 
-export async function destinationFor(worker, provider, env = process.env) {
+export async function codexDestination(provider, env = process.env, project = process.cwd()) {
+  const { config, account } = await readCodexConfiguration(project, env);
+  const route = routingFromConfig(config, account, env, provider);
+  return { provider: route.provider, endpoint: endpoint(route.base) };
+}
+
+export async function destinationFor(worker, provider, env = process.env, project = process.cwd()) {
   let result;
   if (worker === 'claude') {
     let config;
     try { config = configuredClaude(); } catch { throw new Error('Claude inference configuration is unavailable or invalid; inspect the local worker settings.'); }
     result = { provider: config.provider, endpoint: endpoint(config.base) };
+  } else if (worker === 'codex') {
+    result = await codexDestination(provider, env, project);
   } else if (worker === 'hermes') {
     const adapter = new URL('./hermes-adapter.py', import.meta.url);
     let stdout;

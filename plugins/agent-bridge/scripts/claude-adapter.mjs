@@ -5,6 +5,8 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { entryFor } from './workers.mjs';
+import { createProgressTracker } from './zcode-progress.mjs';
+import { effortEvidence } from './quality.mjs';
 
 export function configuredClaude() {
   const settingsPath = process.env.CLAUDE_WORKER_SETTINGS || path.join(os.homedir(), '.claude/settings.json');
@@ -52,19 +54,20 @@ export function claudeInvocation(state, config, prompt) {
     ANTHROPIC_MODEL: state.model, ANTHROPIC_DEFAULT_HAIKU_MODEL: state.model,
     ANTHROPIC_DEFAULT_SONNET_MODEL: state.model, ANTHROPIC_DEFAULT_OPUS_MODEL: state.model,
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
-    CLAUDE_CODE_DISABLE_AUTO_COMPACT: '1', NO_COLOR: '1',
+    CLAUDE_CONFIG_DIR: state.resume?.runtimeProfile || path.join(state.job, 'claude-runtime'), NO_COLOR: '1',
   });
   if (state.effort !== 'provider-default') Object.assign(env, {
     CLAUDE_CODE_ALWAYS_ENABLE_EFFORT: '1', CLAUDE_CODE_EFFORT_LEVEL: state.effort,
     ANTHROPIC_CUSTOM_MODEL_OPTION: state.model,
     ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES: 'effort,max_effort,thinking',
   });
-  const args = ['--bare', '--print', '--output-format', 'json', '--no-session-persistence',
+  const args = ['--bare', '--print', '--output-format', 'stream-json', '--verbose', '--include-partial-messages',
     '--setting-sources', '', '--settings', JSON.stringify({ disableAllHooks: true, autoMemoryEnabled: false }),
     '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--disable-slash-commands', '--no-chrome',
     '--model', state.model, ...(state.effort === 'provider-default' ? [] : ['--effort', state.effort]),
     '--permission-mode', 'dontAsk', '--tools', tools, '--allowedTools', tools,
-    '--max-turns', '24', '--append-system-prompt', prompt];
+    '--append-system-prompt', prompt];
+  if (state.resume?.mode === 'native') args.push('--resume', state.resume.sessionId);
   return { args, env };
 }
 
@@ -83,27 +86,56 @@ async function main() {
   if (!selected || !selected.reasoning_levels.includes(state.effort)) throw new Error('Claude model/provider/effort is unavailable; refresh list_models.');
   const prompt = fs.readFileSync(path.join(job, 'prompt.md'), 'utf8');
   const { args, env } = claudeInvocation(state, config, prompt);
+  fs.mkdirSync(env.CLAUDE_CONFIG_DIR, { recursive: true, mode: 0o700 });
   const entry = state.entry || entryFor('claude');
+  const progress = createProgressTracker(job, { source: 'claude-cli', worker: 'claude' });
   const child = spawn(/\.(?:m?js|cjs)$/.test(entry) ? process.execPath : entry,
     /\.(?:m?js|cjs)$/.test(entry) ? [entry, ...args] : args,
     { cwd: state.project, env, stdio: ['pipe', 'pipe', 'pipe'] });
-  process.once('SIGTERM', () => { child.kill('SIGTERM'); process.exit(143); });
-  let stdout = '', stderr = '', size = 0;
-  const capture = target => data => {
-    size += data.length;
-    if (size > 16 * 1024 * 1024) { child.kill('SIGTERM'); return; }
-    if (target === 'out') stdout += data; else stderr += data;
+  process.once('SIGTERM', () => { child.kill('SIGTERM'); progress.finish(true); progress.close(); process.exit(143); });
+  progress.monitoring('unsupported');
+  progress.phase('waiting_for_model');
+  progress.activity('process_started');
+  let buffer = '', stderr = '', raw, parseError;
+  const observe = message => {
+    if (message.session_id && progress.snapshot().sessionId !== message.session_id) progress.bindSession(message.session_id);
+    if (message.type && progress.snapshot().monitoring !== 'subscribed') progress.monitoring('subscribed');
+    if (message.type === 'result' || (!message.type && Object.hasOwn(message, 'result'))) { raw = message; return; }
+    const event = message.event || {};
+    if (message.type === 'stream_event') {
+      const block = event.content_block;
+      if (event.type === 'content_block_start' && block?.type === 'tool_use') progress.toolStarted(block.id, block.name);
+      if (event.delta?.type === 'text_delta') progress.streaming('response', event.delta.text?.length || 0);
+      if (event.delta?.type === 'thinking_delta') progress.streaming('reasoning', event.delta.thinking?.length || 0);
+    }
+    for (const block of message.message?.content || []) {
+      if (block.type === 'tool_use') progress.toolStarted(block.id, block.name);
+      if (block.type === 'tool_result') progress.toolFinished(block.tool_use_id, undefined, !!block.is_error);
+    }
   };
-  child.stdout.on('data', capture('out')); child.stderr.on('data', capture('err'));
+  const consume = line => {
+    if (!line.trim()) return;
+    try { observe(JSON.parse(line)); } catch { parseError = new Error('Claude returned an invalid event stream.'); child.kill('SIGTERM'); }
+  };
+  child.stdout.on('data', data => {
+    buffer += data;
+    let at; while ((at = buffer.indexOf('\n')) >= 0) { consume(buffer.slice(0, at)); buffer = buffer.slice(at + 1); }
+    if (buffer.length > 16 * 1024 * 1024) { parseError = new Error('Claude event exceeded the output limit.'); child.kill('SIGTERM'); }
+  });
+  child.stderr.on('data', data => { stderr = (stderr + data).slice(-12000); });
   child.stdin.on('error', () => {});
   child.stdin.end('Complete the assigned task:\n\n' + fs.readFileSync(path.join(job, 'task.md'), 'utf8'));
   const exitCode = await new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve); });
   if (stderr) fs.writeSync(2, redact(stderr).slice(-12000));
-  let raw;
-  try { raw = JSON.parse(stdout.trim()); } catch { throw new Error('Claude returned no valid JSON result; inspect local stderr.log.'); }
+  consume(buffer);
+  if (parseError || !raw) { progress.finish(true); progress.close(); throw parseError || new Error('Claude returned no valid result event; inspect local stderr.log.'); }
+  if (raw.session_id) progress.bindSession(raw.session_id);
   const notes = [];
   if (exitCode !== 0 || raw.is_error) notes.push('Claude failed: ' + (raw.subtype || 'nonzero exit'));
-  if (raw.permission_denials?.length) notes.push('Claude denied ' + raw.permission_denials.length + ' tool request(s); the host must handle the blocked actions.');
+  if (raw.permission_denials?.length) {
+    notes.push('Claude denied ' + raw.permission_denials.length + ' tool request(s); the host must handle the blocked actions.');
+    progress.blocked('permission_denials');
+  }
   const actualModels = Object.keys(raw.modelUsage || {});
   if (actualModels.some(x => x.toLowerCase() !== state.model.toLowerCase())) notes.push('Claude reported a different model: ' + actualModels.join(', '));
   const response = typeof raw.result === 'string' && raw.result.trim() ? raw.result : '';
@@ -111,6 +143,7 @@ async function main() {
   const result = { jobId: state.id, worker: 'claude', sessionId: raw.session_id || state.id,
     response: redact(response || notes.join('; ')), notes,
     model: { providerId: state.provider, modelId: state.model, options: { reasoningLevel: state.effort } },
+    effortEvidence: effortEvidence(state, { parameter: '--effort / CLAUDE_CODE_EFFORT_LEVEL', supportedLevels: selected.reasoning_levels }),
     providerLabel: 'Claude Code / configured ' + config.provider,
     usage: raw.usage ? { inputTokens: raw.usage.input_tokens, outputTokens: raw.usage.output_tokens,
       cacheReadTokens: raw.usage.cache_read_input_tokens, cacheCreationTokens: raw.usage.cache_creation_input_tokens,
@@ -120,6 +153,8 @@ async function main() {
       }])), turns: raw.num_turns } : null,
     projection: { status: notes.length ? 'error' : 'idle' } };
   fs.writeFileSync(path.join(job, 'adapter-result.json'), JSON.stringify(result), { mode: 0o600 });
+  progress.finish(notes.length > 0);
+  progress.close();
 }
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().catch(e => { fs.writeSync(2, 'Claude adapter: ' + e.message + '\n'); process.exitCode = 1; });
