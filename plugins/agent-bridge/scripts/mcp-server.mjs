@@ -8,6 +8,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { hostName } from './destination.mjs';
 import { contractSchema, checksSchema, validateValue } from './quality.mjs';
+import { goalTools, callGoalTool } from './goals.mjs';
 
 const bridge = fileURLToPath(new URL('./bridge.mjs', import.meta.url));
 const version = JSON.parse(fs.readFileSync(new URL('../plugin.json', import.meta.url), 'utf8')).version;
@@ -30,6 +31,7 @@ const selection = {
 };
 const requiredSelection = ['worker', 'project', 'task', 'provider', 'model', 'effort', 'selection_reason', 'read_scope', 'mode'];
 export const tools = [
+  ...goalTools,
   { name: 'list_workers', description: 'List installed worker runtimes and the configured host. Installation does not prove configuration, model entitlement or authorization. The current host agent dispatches and accepts results; workers must not delegate recursively.', inputSchema: schema({}, []), annotations: annotations(true) },
   { name: 'list_models', description: 'Discover provider/model IDs and reasoning levels for one worker without sending an inference prompt. May query its configured provider catalog or create a local discovery session. Catalog source is reported; local config is not proof of entitlement. Reuse within the task.', inputSchema: schema({ worker, project }, ['worker', 'project']), annotations: annotations(false, true) },
   { name: 'prepare_dispatch', description: 'Resolve the selected worker destination from local configuration and bind the task, host, runtime, scope and selection to a 30-minute preparation reference. Sends no inference prompt or catalog request. Returns actual endpoint and task scope for host authorization review. Reference is not user approval. Expiry only blocks new dispatch; it never terminates running work. Re-preparing an unchanged destination/scope does not require re-asking already-sufficient direct authorization.', inputSchema: schema(selection, requiredSelection), annotations: annotations(false) },
@@ -71,7 +73,10 @@ async function run(args) {
     let error;
     try { error = JSON.parse(e.stdout).error; } catch {}
     // Do not reflect raw stderr, provider logs or credential-bearing config.
-    throw new Error(error || 'Bridge command failed; inspect the local job logs if a job was created.');
+    const failure = new Error(error || 'Bridge command failed; inspect the local job logs if a job was created.');
+    // A normal CLI rejection is distinguishable from a timeout or a lost transport reply.
+    failure.bridgeCommandExited = typeof error === 'string' && Number.isInteger(e.code) && e.code !== 0 && !e.killed && !e.signal;
+    throw failure;
   }
 }
 
@@ -79,6 +84,7 @@ export async function callTool(name, args) {
   const tool = tools.find(t => t.name === name);
   if (!tool) throw new Error('Unknown tool: ' + name);
   validate(tool, args);
+  if (goalTools.some(t => t.name === name)) return callGoalTool(name, args, callTool);
   if (name === 'list_workers') return run(['workers']);
   if (name === 'list_models') return run(['models', '--worker', args.worker, '--project', args.project]);
   if (name === 'record_review') {
@@ -125,7 +131,7 @@ async function handle(message) {
     const requested = message.params?.protocolVersion;
     return reply({ protocolVersion: supported.includes(requested) ? requested : '2025-11-25', capabilities: { tools: {} },
       serverInfo: { name: 'agent-bridge', version },
-      instructions: `The ${hostName()} host agent chooses workers/models using a quality-first policy and independently accepts results. New tasks should include task_contract with verifiable criteria. Discover, prepare_dispatch, verify user authorization for the actual endpoint and scope, then dispatch_task. After independent checks use record_review; ready_for_review is not acceptance. A preparation reference or client identity is not approval. Workers must not recursively delegate.` });
+      instructions: `The ${hostName()} host agent chooses workers/models using a quality-first policy and independently accepts results. New tasks should include task_contract with verifiable criteria. Discover, prepare_dispatch, verify user authorization for the actual endpoint and scope, then dispatch_task. For an explicitly requested goal loop, create_goal freezes participants/scope/limits; submit all loop execution and continuation decisions through advance_goal after normal preflight. Relay scoped messages between ended turns and independently record_goal_review against the current source snapshot. Status/reconcile never start inference. After independent child-task checks use record_review; ready_for_review is not acceptance. A preparation reference, goal record or client identity is not approval. Workers must not recursively delegate.` });
   }
   if (message.method === 'ping') return reply({});
   if (message.method === 'tools/list') return reply({ tools });

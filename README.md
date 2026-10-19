@@ -2,7 +2,7 @@
 
 当前版本：0.2.3。更新记录见 [CHANGELOG](CHANGELOG.md)。
 
-Agent Bridge 是插件，包含 MCP 执行核心和 `dispatch` Skill。Skill 指导宿主如何派发与验收任务，MCP 负责实际执行。
+Agent Bridge 是插件，包含 MCP 执行核心、`dispatch` 和 `loop` Skill。Skill 指导宿主如何派发、协作与验收，MCP 负责执行并持久化状态。
 
 由当前宿主 Agent 选择 worker、模型和推理强度，Bridge 执行任务，结果交回宿主验收。装在 Codex、Claude Code、Z Code 或 Hermes 中，就由对应的当前会话调度；仍可调用其他 worker。
 
@@ -26,6 +26,17 @@ flowchart LR
 - `dispatch_task` 核对预检参数与当前目的地，再启动异步任务。同一项目串行执行，相同 `request_id` 和参数复用原任务。默认没有总时长上限；显式给出的正数时间预算会被执行且可超过一小时。
 - `.ai/` 保存预检记录、任务、结果与周期性检查点，支持取消和已保存结果恢复；不要提交这些运行产物。
 - 每个 worker 都持久化紧凑进度：阶段、最近活动、工具进度、阻塞和会话编号，并附带仅提示性的疑似停滞评估；静默不会被自动终止。
+- 可选 Goal Loop 在任务之上保存总目标、固定参与者、消息、累计预算和源码版本验收，由宿主串行推进实现、评审和返修。
+
+## 目标导向协作
+
+```text
+$agent-bridge:loop -w=claude -m=glm-5.3 实现 <目标>，修改范围 <目录>，最多 8 个任务、3 次返修
+```
+
+宿主创建目标后持续选择下一步，通过 Bridge 派发实现或评审 Agent，并在每轮结束后转发结构化消息。整体目标只有经过独立验证才能完成；源码改变后原验收失效。暂停、恢复、取消、重复请求和累计停止规则都有持久化记录。
+
+第一版由当前宿主会话驱动，使用串行轮次和主控转发消息。使用方法、恢复流程及边界见 [Goal Loop](plugins/agent-bridge/GOAL_LOOP.md) 和 [Loop Skill](plugins/agent-bridge/skills/loop/SKILL.md)。
 
 ## 怎么使用
 
@@ -113,6 +124,6 @@ worker 复用各自的模型服务配置；可用执行器、模型和推理强�
 
 `orphaned` 时先取消存活的 worker，再检查部分修改；`interrupted` 可读取已有产物和检查点。取消不会回滚源码；`recover_result` 只读取已保存结果，不会恢复执行——需要继续时用 `continue_task`。
 
-开发、CLI 和参数说明见 [核心实现](plugins/agent-bridge/README.md)。Token 统计仅供参考，以服务商账单或额度记录为准；货币类预算控制不被接受，唯一强制执行的预算是显式时间预算。
+开发、CLI 和参数说明见 [核心实现](plugins/agent-bridge/README.md)。Token 统计仅供参考，以服务商账单或额度记录为准；货币类预算控制不被接受。单任务执行器支持显式时间预算，Goal Loop 另外限制累计步骤、返修、无进展及可选目标时长。
 
 [MIT License](LICENSE)

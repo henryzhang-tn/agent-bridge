@@ -4,13 +4,15 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `scripts/mcp-server.mjs` | 10 个 MCP 工具、参数校验 |
+| `scripts/mcp-server.mjs` | 16 个 MCP 工具、参数校验 |
+| `scripts/goals.mjs` | 目标状态、串行决策、主控消息转发、累计预算与源码版本验收 |
 | `scripts/quality.mjs` | 任务标准校验、推理建议、验收证据规则和质量状态 |
 | `scripts/destination.mjs` / `codex-config.mjs` | 本地解析实际 provider/endpoint（Codex 使用其生效配置和登录类型），显式识别宿主 |
 | `scripts/bridge.mjs` | 预检、参数绑定、任务锁、去重、取消、检查点、续接、结果恢复 |
 | `scripts/*-adapter.*` / `zcode-protocol.mjs` | 调用各 worker，复用其配置；凭据不写入任务记录 |
 | `scripts/zcode-progress.mjs` | 全 worker 共用的进度跟踪：阶段、最近活动、工具进度与仅提示性停滞评估 |
 | `skills/dispatch/SKILL.md` | 当前宿主的调度和验收规则 |
+| `skills/loop/SKILL.md` | 目标循环的推进、恢复、消息和整体验收规则 |
 | `../../scripts/build-packages.mjs` | 从根 `plugin.json` 生成各宿主清单与 MCP 配置 |
 | `../../scripts/host-config.mjs` | 打印手动接入配置，不修改宿主设置 |
 
@@ -90,7 +92,7 @@ worker 返回并退出后，宿主独立检查文件和执行验证，再调用 
 
 验收记录保存在私有 `.ai/tasks/<job>/reviews/`，最新记录在 `review.json`，权限为 0600。相同 `review_id` 和证据重试复用已有记录，不启动推理，也不撤销更新的验收；改变证据需新 ID。结果或执行状态变化时既有验收标记 `stale`。验收反映记录时的验证，后续源码变化仍须重新验证。
 
-返修使用显式 `continue_task`，原 contract 和标准保持不变，失败/未验证项与证据自动进入交接提示；新任务记录 `reworkCount`。两次返修后提示宿主重新评估根因、拆分或模型，不自动循环或切换模型。CLI 对应 `review --job DIR --review-id ID --review-file CHECKS_JSON`（文件内容是 checks 数组）。
+单任务返修使用显式 `continue_task`，原 contract 和标准保持不变，失败/未验证项与证据自动进入交接提示；新任务记录 `reworkCount`。两次返修后提示宿主重新评估根因、拆分或模型，单任务执行器不自动循环或切换模型。显式启用 [Goal Loop](GOAL_LOOP.md) 时，由宿主通过 `advance_goal` 在累计预算内推进派发与续接。CLI 对应 `review --job DIR --review-id ID --review-file CHECKS_JSON`（文件内容是 checks 数组）；目标工具当前由 MCP 提供。
 
 `effortEvidence` 分开记录 `requested`、`sentToRuntime`、`runtimeConfirmed`、`providerConfirmed`、参数位置和确认来源。没有回传确认时为 null；发送参数不等于服务端确认思考预算。Z Code 可记录模型设置回执；Codex 只使用当前回合的明确 effort 回执，不把线程原有默认值当作本回合确认。Claude/Hermes 通常没有 effort 回传，因此不声称已确认。`selectedModel` 保留为兼容的选择元数据。
 
@@ -98,7 +100,7 @@ worker 返回并退出后，宿主独立检查文件和执行验证，再调用 
 
 默认执行没有总时长上限：不提供 `timeout_seconds` 时任务不会因为运行久而终止。显式提供的正数预算会被严格执行，范围为 1 秒至 30 天；预算按墙钟计算，活动不会顺延它。启动、目录查询与控制 RPC 保持独立的短超时；适配器对运行中的回合不设内部计时器。运行时或服务商自身的上下文、轮次及额度限制仍然适用，结束后可按检查点续接。
 
-货币类预算控制不被接受：Token/用量计数只是参考，不是费用、配额或订阅额度；不要把 `usage` 当作账单。唯一被强制执行的预算是上面的显式时间预算。
+货币类预算控制不被接受：Token/用量计数只是参考，不是费用、配额或订阅额度；不要把 `usage` 当作账单。单任务执行器只强制执行上面的显式时间预算；Goal Loop 另外限制累计步骤、返修、无进展及可选目标时长。
 
 ## 任务进度
 

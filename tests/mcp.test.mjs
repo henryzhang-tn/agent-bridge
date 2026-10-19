@@ -425,3 +425,103 @@ test('scope symlink retargeting is blocked but replay of an existing job needs n
   assert.equal(repeated.reused, true); assert.equal(repeated.job, submitted.job);
   assert.equal(f.requestLog().filter(x => x.method === 'session/send').length, 1);
 });
+test('MCP goal loop relays two participants, resumes rework and binds final acceptance to source', async t => {
+  const f = fixture(t);
+  fs.mkdirSync(path.join(f.root, 'src'));
+  fs.writeFileSync(path.join(f.root, 'src/value.txt'), 'before');
+  const criteria = [{ id: 'overall', description: 'The complete fixture meets the goal.', verification: 'Host checks fixture contents.', verification_kind: 'source' }];
+  const contract = { complexity: 'standard', context: 'Synthetic goal fixture.', allowed_edits: [], preserve: [],
+    integration: 'Host validates the complete fixture.', acceptance_criteria: criteria };
+  const participants = ['implementer', 'reviewer'].map(id => ({ id, worker: f.args.worker, provider: f.args.provider,
+    model: f.args.model, effort: f.args.effort, endpoint: 'http://127.0.0.1:9000', mode: 'plan' }));
+  const call = async (name, args) => {
+    const r = await f.call(name, args);
+    assert.equal(r.isError, false, r.content?.[0]?.text);
+    return r.structuredContent;
+  };
+  const made = await call('create_goal', { project: f.root, goal_id: 'integration-goal', objective: 'Verify serial cooperation.',
+    context: 'Implement, review, rework, verify.', read_scope: ['src'], allowed_edits: ['src'], acceptance_criteria: criteria,
+    participants, limits: { max_steps: 4, max_reworks: 2, max_no_progress: 3 } });
+  const goal = made.goal;
+  assert.ok(path.isAbsolute(goal));
+  const runStep = async (operation_id, participant_id, task, previousJob) => {
+    const selected = { ...f.args, task, read_scope: ['src'], task_contract: contract };
+    const p = await call('prepare_dispatch', selected);
+    const execution = { ...selected, prepared_ref: p.preparedRef, endpoint: p.destination.endpoint,
+      ...(previousJob ? { job: previousJob } : {}) };
+    const advanced = await call('advance_goal', { goal, operation_id, action: previousJob ? 'continue' : 'dispatch', participant_id, execution });
+    const job = advanced.steps.at(-1).job;
+    assert.ok(job, 'a new linked job was launched'); f.jobs.push(job);
+    await call('task_status', { job, wait_seconds: 3 });
+    const repeated = await call('advance_goal', { goal, operation_id, action: previousJob ? 'continue' : 'dispatch', participant_id, execution });
+    assert.ok(repeated);
+    return job;
+  };
+  const verifyTask = (job, id) => call('record_review', { job, review_id: id, checks: [
+    { criterion_id: 'overall', status: 'passed', verification_kind: 'source', evidence: 'Host inspected the synthetic worker result.' },
+  ] });
+  const first = await runStep('implement-1', 'implementer', 'Read the bounded fixture and propose a fix.');
+  await verifyTask(first, 'impl-accepted');
+  await call('send_goal_message', { goal, message_id: 'handoff', to: 'reviewer', type: 'question',
+    body: 'Inspect the proposal against the goal.', source_job: first, artifact_refs: ['src/value.txt'] });
+  const inbox = await call('read_goal_messages', { goal, recipient: 'reviewer' });
+  assert.match(JSON.stringify(inbox), /Inspect the proposal/);
+  const reviewer = await runStep('review-1', 'reviewer', 'Review the fixture. Handoff: Inspect the proposal against the goal.');
+  await verifyTask(reviewer, 'review-accepted');
+  await call('send_goal_message', { goal, message_id: 'feedback', to: 'implementer', type: 'review',
+    body: 'The fixture needs the corrected contents.', reply_to: 'handoff', source_job: reviewer });
+  const status = await call('goal_status', { goal });
+  await call('record_goal_review', { goal, review_id: 'overall-failed', snapshot_fingerprint: status.snapshot_fingerprint,
+    checks: [{ criterion_id: 'overall', status: 'failed', verification_kind: 'source', evidence: 'Fixture still contains before.' }] });
+  const rework = await runStep('rework-1', 'implementer', 'Address only the review feedback and preserve passing behavior.', first);
+  await verifyTask(rework, 'rework-accepted');
+  fs.writeFileSync(path.join(f.root, 'src/value.txt'), 'after!');
+  const finalVersion = await call('goal_status', { goal });
+  const completed = await call('record_goal_review', { goal, review_id: 'overall-pass', snapshot_fingerprint: finalVersion.snapshot_fingerprint,
+    checks: [{ criterion_id: 'overall', status: 'passed', verification_kind: 'source', evidence: 'Host read after! from the actual fixture.' }] });
+  assert.equal(completed.status, 'completed');
+  assert.equal(f.requestLog().filter(x => x.method === 'session/send').length, 3);
+  fs.writeFileSync(path.join(f.root, 'src/value.txt'), 'other!');
+  const changed = await call('goal_status', { goal });
+  assert.notEqual(changed.status, 'completed');
+  assert.notEqual(changed.snapshot_fingerprint, finalVersion.snapshot_fingerprint);
+});
+
+test('MCP goal recovers from an expired preparation without replaying a rejected operation', async t => {
+  const f = fixture(t), task_contract = qualityContract();
+  const selected = { ...f.args, task_contract };
+  const call = async (name, args) => {
+    const r = await f.call(name, args);
+    assert.equal(r.isError, false, r.content?.[0]?.text);
+    return r.structuredContent;
+  };
+  const prepare = () => call('prepare_dispatch', selected);
+  const p = await prepare();
+  const participant = { id: 'implementer', worker: selected.worker, provider: selected.provider,
+    model: selected.model, effort: selected.effort, endpoint: p.destination.endpoint, mode: selected.mode };
+  const { goal } = await call('create_goal', { project: f.root, goal_id: 'expired-preflight', objective: 'Recover a rejected execution.',
+    context: 'Synthetic recovery fixture.', read_scope: selected.read_scope, allowed_edits: [], acceptance_criteria: task_contract.acceptance_criteria,
+    participants: [participant], limits: { max_steps: 3, max_reworks: 1, max_no_progress: 3 } });
+  const recordPath = path.join(f.root, '.ai/preparations', p.preparedRef + '.json');
+  const record = JSON.parse(fs.readFileSync(recordPath)); record.expiresAt = Date.now() - 1;
+  fs.writeFileSync(recordPath, JSON.stringify(record));
+  const request = { goal, action: 'dispatch', operation_id: 'expired', participant_id: participant.id,
+    execution: { ...selected, prepared_ref: p.preparedRef, endpoint: p.destination.endpoint } };
+  const refused = await f.call('advance_goal', request);
+  assert.equal(refused.isError, true); assert.match(refused.content[0].text, /expired/);
+  const rejected = await call('goal_status', { goal });
+  assert.equal(rejected.steps[0].status, 'dispatch_rejected');
+  assert.equal((await call('advance_goal', request)).reused, true);
+  assert.equal(f.requestLog().length, 0);
+  const fresh = await prepare();
+  const advanced = await call('advance_goal', { ...request, operation_id: 'fresh',
+    execution: { ...request.execution, prepared_ref: fresh.preparedRef } });
+  const job = advanced.steps.at(-1).job; f.jobs.push(job);
+  await call('task_status', { job, wait_seconds: 3 });
+  await call('record_review', { job, review_id: 'accepted', checks: reviewChecks() });
+  const status = await call('goal_status', { goal });
+  const done = await call('record_goal_review', { goal, review_id: 'done', snapshot_fingerprint: status.snapshot_fingerprint, checks: reviewChecks() });
+  assert.equal(done.status, 'completed');
+  assert.equal(done.budget.used.steps, 2, 'rejected attempts remain in the cumulative budget');
+  assert.equal(f.requestLog().filter(x => x.method === 'session/send').length, 1);
+});

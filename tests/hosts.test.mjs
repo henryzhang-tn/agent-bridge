@@ -35,7 +35,10 @@ async function connect(t, config, host) {
   const init = await rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'untrusted-other-host', version: '1' } });
   assert.match(init.instructions, new RegExp(host + ' host agent'));
   const tools = (await rpc('tools/list', {})).tools;
-  assert.equal(tools.length, 10);
+  assert.equal(tools.length, 16);
+  for (const name of ['create_goal', 'goal_status', 'advance_goal', 'send_goal_message', 'read_goal_messages', 'record_goal_review']) {
+    assert.ok(tools.some(x => x.name === name), name);
+  }
   assert.ok(tools.some(x => x.name === 'record_review'));
   const listed = await rpc('tools/call', { name: 'list_workers', arguments: {} });
   assert.equal(listed.structuredContent.host, host);
