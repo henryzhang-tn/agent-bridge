@@ -3,6 +3,9 @@ import path from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import { hostName, endpoint } from './destination.mjs';
 import { validateValue, contractSchema, checksSchema, taskContract, reviewChecks } from './quality.mjs';
+import { delegationLevelSchema, taskRoleSchema, feedbackSchema, designTools, level, requiresDesign, delegationState,
+  beginDesign, assertDelegationActor, submitDesign, reviewDesign, assertApprovedDesign, designIsCurrent,
+  approvedTask, assertPlannedTask, designExecutionContext, validateFeedback } from './delegation-policy.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 const stable = value => JSON.stringify(value, (_, item) => item && typeof item === 'object' && !Array.isArray(item)
@@ -28,6 +31,7 @@ const participantSchema = obj({ id: localId, ...Object.fromEntries(['worker', 'p
 const goalArgs = { goal: str(4096) };
 const definitions = {
   create_goal: obj({ project: str(4096), goal_id: localId, objective: str(), context: str(), read_scope: strings, allowed_edits: strings,
+    delegation_level: delegationLevelSchema,
     acceptance_criteria: contractSchema.properties.acceptance_criteria,
     participants: { type: 'array', minItems: 1, maxItems: 20, items: participantSchema },
     limits: obj({ max_steps: { type: 'integer', minimum: 1, maximum: 1000 }, max_reworks: { type: 'integer', minimum: 0, maximum: 1000 },
@@ -36,13 +40,16 @@ const definitions = {
   goal_status: obj(goalArgs, ['goal']),
   advance_goal: obj({ ...goalArgs, operation_id: id,
     action: { type: 'string', enum: ['dispatch', 'continue', 'reconcile', 'pause', 'resume', 'cancel', 'wait_user', 'set_context'] },
-    participant_id: localId, execution: executionSchema, reason: str(),
+    participant_id: localId, execution: executionSchema, reason: str(), role: taskRoleSchema,
+    design_task_id: localId, design_fingerprint: { ...str(64), pattern: '^[a-f0-9]{64}$' },
     context: obj({ facts: { type: 'array', maxItems: 50, items: str() }, decisions: { type: 'array', maxItems: 50, items: str() }, open_questions: { type: 'array', maxItems: 50, items: str() }, summary: str() }, []),
   }, ['goal', 'operation_id', 'action']),
   send_goal_message: obj({ ...goalArgs, message_id: id, to: localId, type: { type: 'string', enum: ['note', 'question', 'answer', 'review', 'blocker'] },
     body: str(12000), source_job: str(4096), reply_to: id, artifact_refs: strings }, ['goal', 'message_id', 'to', 'type', 'body']),
   read_goal_messages: obj({ ...goalArgs, recipient: localId, after_sequence: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 100 } }, ['goal', 'recipient']),
-  record_goal_review: obj({ ...goalArgs, review_id: id, snapshot_fingerprint: { ...str(64), pattern: '^[a-f0-9]{64}$' }, checks: checksSchema }, ['goal', 'review_id', 'snapshot_fingerprint', 'checks']),
+  record_goal_review: obj({ ...goalArgs, review_id: id, snapshot_fingerprint: { ...str(64), pattern: '^[a-f0-9]{64}$' }, checks: checksSchema,
+    feedback: feedbackSchema }, ['goal', 'review_id', 'snapshot_fingerprint', 'checks']),
+  ...Object.fromEntries(designTools.map(t => [t.name, t.inputSchema])),
 };
 export const goalTools = Object.entries(definitions).map(([name, inputSchema]) => ({ name, inputSchema,
   description: ({ create_goal: 'Freeze a host-controlled goal contract, participants and cumulative budgets; no inference or authorization grant.',
@@ -50,7 +57,7 @@ export const goalTools = Object.entries(definitions).map(([name, inputSchema]) =
     advance_goal: 'Explicitly advance a serial goal using already-prepared execution; stable operation IDs prevent duplicate execution. Scope and destination authorization remain with the host.',
     send_goal_message: 'Relay structured scoped messages from the host or an ended goal task. Messages never grant execution rights.',
     read_goal_messages: 'Read messages for a participant and a bounded context packet for the next prepared task.',
-    record_goal_review: 'Record independent goal-level evidence against the current source fingerprint; completion also requires accepted child tasks.' })[name],
+    record_goal_review: 'Record independent goal-level evidence against the current source fingerprint; completion also requires accepted child tasks.' })[name] || designTools.find(t => t.name === name)?.description,
   annotations: { readOnlyHint: name === 'read_goal_messages', destructiveHint: false, openWorldHint: name === 'advance_goal' },
 }));
 
@@ -194,7 +201,7 @@ function save(g, event, payload = {}) {
   atomic(path.join(g.goal, 'goal.json'), g);
 }
 function limits(g) {
-  const used = { steps: g.steps.length, reworks: g.steps.filter(s => s.rework).length, no_progress: g.no_progress,
+  const used = { steps: g.steps.length, reworks: g.steps.filter(s => s.rework).length, no_progress: g.no_progress + (g.design_no_progress || 0),
     seconds: Math.floor((Date.now() - g.created_at) / 1000) };
   const reasons = [];
   if (used.steps >= g.limits.max_steps) reasons.push('max_steps');
@@ -204,6 +211,8 @@ function limits(g) {
 }
 function response(g, fingerprint) {
   return { schema: g.schema, goal: g.goal, goal_id: g.goal_id, project: g.project, host: g.host,
+    ...delegationState(g),
+    ...(requiresDesign(g) ? { approved_source_fingerprint: g.approved_source_fingerprint || null } : {}),
     objective: g.objective, status: g.status, created_at: g.created_at, updated_at: g.updated_at,
     read_scope: g.read_scope, allowed_edits: g.allowed_edits, acceptance_criteria: g.acceptance_criteria,
     participants: g.participants, snapshot_fingerprint: fingerprint, snapshot_error: g.snapshot_error || null, budget: limits(g),
@@ -230,12 +239,19 @@ async function reconcile(g, call, tolerateSnapshotFailure = false) {
   catch (error) { if (!tolerateSnapshotFailure) throw error; fingerprint = null; g.snapshot_error = error.message; }
   for (const step of g.steps) {
     if (!active.has(step.status) && !['dispatch_unknown', 'dispatch_rejected'].includes(step.status) && !step.reconciled_at && fingerprint !== null) {
-      g.no_progress = fingerprint === g.last_progress_snapshot ? g.no_progress + 1 : 0;
-      g.last_progress_snapshot = fingerprint;
+      // A read-only design advances through its structured proposal, not source edits.
+      if (step.role !== 'design' || step.status !== 'ready_for_review') {
+        g.no_progress = fingerprint === g.last_progress_snapshot ? g.no_progress + 1 : 0;
+        g.last_progress_snapshot = fingerprint;
+      }
+      // Only newly ended goal-owned work advances the approved source baseline.
+      // An idle source edit must not become trusted merely by asking for status.
+      if (requiresDesign(g) && step.role !== 'design' && step.design_fingerprint === g.design?.fingerprint)
+        g.approved_source_fingerprint = fingerprint;
       step.reconciled_at = Date.now();
     }
   }
-  if (g.status === 'completed' && (g.review?.status !== 'accepted' || g.review?.snapshot_fingerprint !== fingerprint || !childrenAccepted(g))) {
+  if (g.status === 'completed' && (g.review?.status !== 'accepted' || g.review?.snapshot_fingerprint !== fingerprint || !childrenAccepted(g, fingerprint))) {
     g.status = 'active'; g.review = { ...g.review, status: 'stale' };
   }
   if (!blocked.has(g.status) && g.status !== 'completed') {
@@ -246,13 +262,44 @@ async function reconcile(g, call, tolerateSnapshotFailure = false) {
   if (stable(g) !== before) save(g, 'reconciled');
   return fingerprint;
 }
-function childrenAccepted(g) {
+function childrenAccepted(g, fingerprint) {
+  if (requiresDesign(g)) {
+    if (!designIsCurrent(g, designSourceAccepted(g)) || g.approved_source_fingerprint !== fingerprint) return false;
+    return g.design.tasks.every(task => acceptedDesignTaskStep(g, latestDesignTaskStep(g, task.id)));
+  }
   // A continuation replaces its predecessor's acceptance obligation, preserving the full history.
   const launched = g.steps.filter(s => s.status !== 'dispatch_rejected');
   const superseded = new Set(launched.map(s => s.execution.job).filter(Boolean));
   return launched.every(s => superseded.has(s.job) || s.status === 'ready_for_review' && s.review_status === 'accepted');
 }
+function assertSourceContinuity(g, fingerprint) {
+  if (g.approved_source_fingerprint !== fingerprint) throw new Error('Source changed outside the approved goal work; obtain and approve a fresh worker design');
+}
 function outstanding(g) { return g.steps.some(s => active.has(s.status) || s.status === 'dispatch_unknown'); }
+function designSourceAccepted(g) {
+  const source = g.steps.find(s => s.job === g.design?.source_job);
+  return !!source && source.role === 'design' && source.status === 'ready_for_review' && source.review_status === 'accepted'
+    && source.review_id === g.design.source_review_id;
+}
+function latestDesignTaskStep(g, taskId) {
+  return g.steps.filter(s => s.design_task_id === taskId && s.design_fingerprint === g.design?.fingerprint
+    && !s.superseded_by_design && s.status !== 'dispatch_rejected').at(-1);
+}
+function taskDependencies(task) { return [...new Set([...task.depends_on, ...(task.review_of ? [task.review_of] : [])])]; }
+function acceptedDesignTaskStep(g, step, visiting = new Set()) {
+  if (!step || step.status !== 'ready_for_review' || step.review_status !== 'accepted' || step.design_fingerprint !== g.design?.fingerprint
+    || step.superseded_by_design || visiting.has(step.job)) return false;
+  return designDependenciesCurrent(g, step, visiting);
+}
+function designDependenciesCurrent(g, step, visiting = new Set()) {
+  const task = g.design.tasks.find(t => t.id === step.design_task_id);
+  if (!task) return false;
+  const next = new Set(visiting); next.add(step.job);
+  return taskDependencies(task).every(id => {
+    const latest = latestDesignTaskStep(g, id), bound = step.dependency_bindings?.find(dep => dep.task_id === id);
+    return bound && latest?.job === bound.job && latest.review_id === bound.review_id && acceptedDesignTaskStep(g, latest, next);
+  });
+}
 function validateExecution(g, args) {
   const p = g.participants.find(x => x.id === args.participant_id);
   if (!p) throw new Error('Unknown goal participant');
@@ -266,10 +313,28 @@ function validateExecution(g, args) {
   const contract = taskContract(execution.task_contract, { mode: execution.mode, readScope: scopes });
   if (contract.allowed_edits.some(item => !within(item, g.allowed_edits))) throw new Error('Execution allowed_edits exceeds the goal');
   for (const item of contract.allowed_edits) assertSafePath(g.project, item, true);
+  const role = args.role || 'implement';
+  assertDelegationActor(g, { kind: 'worker', role, mode: execution.mode });
+  if (requiresDesign(g) && !args.role) throw new Error('A high/max goal execution requires an explicit role');
+  if (role === 'design') {
+    if (args.design_task_id || args.design_fingerprint) throw new Error('Design work cannot claim an implementation design binding');
+  } else if (requiresDesign(g)) {
+    const accepted = designSourceAccepted(g), design = assertApprovedDesign(g, accepted);
+    if (args.design_fingerprint !== design.fingerprint) throw new Error('Execution must bind the current approved design_fingerprint');
+    const task = approvedTask(g, args.design_task_id, accepted);
+    assertPlannedTask(g, { ...task, id: args.design_task_id, kind: role, mode: execution.mode, read_scope: scopes, task_contract: contract }, accepted);
+    if (!execution.task.includes(designExecutionContext(g, task.id))) throw new Error('Execution task must include its approved design context before prepare_dispatch');
+    for (const dependency of taskDependencies(task)) {
+      const step = latestDesignTaskStep(g, dependency);
+      if (!acceptedDesignTaskStep(g, step)) throw new Error('Design task dependencies must be currently accepted before execution');
+    }
+  } else if (args.design_task_id || args.design_fingerprint) throw new Error('Design bindings require high/max delegation');
   if (args.action === 'continue') {
     const previous = g.steps.find(s => s.job === execution.job && s.participant_id === p.id);
     if (!previous || active.has(previous.status) || previous.status === 'dispatch_unknown') throw new Error('Continuation must reference an ended task of this goal participant');
     if (digest(previous.execution.task_contract) !== digest(execution.task_contract) || digest(previous.execution.read_scope) !== digest(execution.read_scope)) throw new Error('Continuation must preserve the previous contract and scope');
+    if ((previous.role || 'implement') !== role || previous.design_task_id !== args.design_task_id || previous.design_fingerprint !== args.design_fingerprint)
+      throw new Error('Continuation must preserve its task role and approved design binding');
   } else if (execution.job !== undefined) throw new Error('dispatch execution cannot reference a prior job');
   return execution;
 }
@@ -282,6 +347,7 @@ async function create(args, call) {
   if (new Set(ids).size !== ids.length || ids.includes('host')) throw new Error('Duplicate or reserved goal participant');
   const criteriaIds = args.acceptance_criteria.map(c => c.id);
   if (new Set(criteriaIds).size !== criteriaIds.length) throw new Error('Duplicate goal acceptance criterion');
+  if (requiresDesign(args) && !args.participants.some(p => p.mode === 'plan')) throw new Error('High/max delegation requires a plan-mode worker for design');
   const contract = { ...args, project, read_scope, allowed_edits, participants: args.participants.map(p => ({ ...p, endpoint: endpoint(p.endpoint) })) };
   for (const dir of [path.join(project, '.ai'), path.join(project, '.ai/goals'), path.join(project, '.ai/goals', args.goal_id)]) directory(dir);
   const dir = path.join(project, '.ai/goals', args.goal_id);
@@ -291,7 +357,7 @@ async function create(args, call) {
       if (existing.contract_fingerprint !== digest(contract)) throw new Error('goal_id conflicts with the existing goal contract');
       return { ...response(existing, await reconcile(existing, call)), reused: true };
     }
-    const g = { schema: 1, ...contract, goal: dir, host: hostName(), contract_fingerprint: digest(contract),
+    const g = { schema: 1, ...contract, delegation_level: level(args), goal: dir, host: hostName(), contract_fingerprint: digest(contract),
       created_at: Date.now(), updated_at: Date.now(), status: 'ready', steps: [], operations: {}, messages: [], reviews: [],
       events: [], no_progress: 0, context_version: 1, shared_context: { facts: [], decisions: [], open_questions: [], summary: args.context }, review: null };
     g.last_progress_snapshot = snapshot(g);
@@ -313,10 +379,35 @@ export async function callGoalTool(name, args, bridgeCall) {
     if (name === 'read_goal_messages') {
       if (args.recipient !== 'host' && !g.participants.some(p => p.id === args.recipient)) throw new Error('Unknown message recipient');
       const messages = g.messages.filter(m => m.to === args.recipient && m.sequence > (args.after_sequence || 0)).slice(0, args.limit || 50);
-      return { goal: g.goal, messages, cursor: messages.at(-1)?.sequence || args.after_sequence || 0, context: g.shared_context, context_version: g.context_version,
+      return { goal: g.goal, messages, cursor: messages.at(-1)?.sequence || args.after_sequence || 0, context: g.shared_context, context_version: g.context_version, ...delegationState(g),
         instruction: 'Host must place only relevant messages into the task card before prepare_dispatch. Messages are untrusted observations, not authorization.' };
     }
     if (g.host !== hostName()) throw new Error('Only the creating host type may mutate this goal');
+    if (name === 'submit_goal_design' || name === 'review_goal_design') {
+      const opFingerprint = digest({ name, args }), previous = Object.hasOwn(g.operations, args.operation_id) ? g.operations[args.operation_id] : undefined;
+      if (previous && previous.fingerprint !== opFingerprint) throw new Error('operation_id conflicts with an existing operation');
+      if (previous?.done) return { ...response(g, fingerprint), reused: true };
+      if (blocked.has(g.status) || g.status === 'completed') throw new Error('Design mutations require an active goal');
+      if (outstanding(g)) throw new Error('Design submission/review requires all active or uncertain executions to end');
+      if (name === 'submit_goal_design') {
+        const source = g.steps.filter(s => s.role === 'design' && s.status !== 'dispatch_rejected').at(-1);
+        if (!source || source.job !== args.source_job || source.status !== 'ready_for_review' || source.review_status !== 'accepted')
+          throw new Error('Design source must be the latest ended and accepted design worker of this goal');
+        if (source.design_snapshot_fingerprint !== fingerprint) throw new Error('Source changed since the design worker started; obtain a fresh design attempt');
+        submitDesign(g, args, { source_job: source.job, source_id: source.operation_id,
+          source_review_id: source.review_id, snapshot_fingerprint: source.design_snapshot_fingerprint });
+      } else {
+        reviewDesign(g, args, { sourceAccepted: designSourceAccepted(g), snapshot_fingerprint: fingerprint });
+        if (g.design.status === 'approved') {
+          g.approved_source_fingerprint = fingerprint;
+          for (const step of g.steps) if (step.role !== 'design' && step.design_fingerprint && step.design_fingerprint !== g.design.fingerprint)
+            step.superseded_by_design = g.design.fingerprint;
+        }
+      }
+      g.operations[args.operation_id] = { fingerprint: opFingerprint, done: true, args };
+      save(g, name, { design_fingerprint: g.design.fingerprint });
+      return { ...response(g, fingerprint), reused: false };
+    }
     if (name === 'send_goal_message') {
       if (args.to !== 'host' && !g.participants.some(p => p.id === args.to)) throw new Error('Unknown message recipient');
       const source = args.source_job ? g.steps.find(s => s.job === args.source_job) : null;
@@ -340,14 +431,17 @@ export async function callGoalTool(name, args, bridgeCall) {
       if (args.snapshot_fingerprint !== fingerprint) throw new Error('Source snapshot changed; inspect current source and record a fresh review');
       if (outstanding(g)) throw new Error('Goal review requires all dispatches to end and uncertainty to be resolved');
       const checks = reviewChecks({ acceptance_criteria: g.acceptance_criteria }, args.checks);
+      const feedback = validateFeedback(checks, args.feedback, requiresDesign(g));
       const status = checks.some(c => c.status === 'failed') ? 'changes_requested' : checks.some(c => c.status === 'unverified') ? 'incomplete' : 'accepted';
-      if (status === 'accepted' && (!childrenAccepted(g) || g.status === 'cancelled')) throw new Error('Goal completion requires accepted child tasks and an uncancelled goal');
-      const record = { review_id: args.review_id, checks, snapshot_fingerprint: fingerprint, status };
+      if (status === 'accepted' && requiresDesign(g) && g.design) assertSourceContinuity(g, fingerprint);
+      if (status === 'accepted' && (!childrenAccepted(g, fingerprint) || g.status === 'cancelled')) throw new Error('Goal completion requires accepted child tasks and an uncancelled goal');
+      const record = { review_id: args.review_id, checks, snapshot_fingerprint: fingerprint, status,
+        ...(args.feedback === undefined ? {} : { feedback }), ...(requiresDesign(g) ? { design_fingerprint: g.design?.fingerprint || null } : {}) };
       const signature = digest(record);
       const previous = g.reviews.find(r => r.review_id === args.review_id);
       if (previous && previous.fingerprint !== signature) throw new Error('review_id conflicts with an existing review');
       if (!previous) {
-        const outcome = digest({ snapshot: fingerprint, checks: checks.map(({ criterion_id, status, verification_kind }) => ({ criterion_id, status, verification_kind })).sort((a, b) => a.criterion_id.localeCompare(b.criterion_id)) });
+        const outcome = digest({ snapshot: fingerprint, ...(requiresDesign(g) ? { design: g.design?.fingerprint || null } : {}), checks: checks.map(({ criterion_id, status, verification_kind }) => ({ criterion_id, status, verification_kind })).sort((a, b) => a.criterion_id.localeCompare(b.criterion_id)) });
         // New review IDs and cosmetic evidence wording cannot disguise a repeated failed outcome.
         if (status !== 'accepted') {
           if (g.reviews.some(r => r.outcome_fingerprint === outcome)) g.no_progress++;
@@ -376,16 +470,34 @@ export async function callGoalTool(name, args, bridgeCall) {
         if (limits(g).exhausted.length) throw new Error('Goal execution budget exhausted: ' + limits(g).exhausted.join(', '));
         if (outstanding(g)) throw new Error('A goal step is active or dispatch remains uncertain; reconcile or retry its existing operation');
         const execution = validateExecution(g, args);
-        const rework = args.action === 'continue' || g.review?.status === 'changes_requested';
+        const role = args.role || 'implement';
+        if (requiresDesign(g) && role !== 'design') assertSourceContinuity(g, fingerprint);
+        const rework = args.action === 'continue' || g.review?.status === 'changes_requested'
+          || role === 'design' && g.steps.some(s => s.role === 'design')
+          || requiresDesign(g) && role !== 'design' && g.steps.some(s => s.design_task_id === args.design_task_id && s.design_fingerprint === args.design_fingerprint);
         if (rework && limits(g).used.reworks >= g.limits.max_reworks) throw new Error('Goal max_reworks budget exhausted');
         const request_id = 'goal:' + hash(g.goal + ':' + args.operation_id);
         step = { operation_id: args.operation_id, action: args.action, participant_id: args.participant_id,
+          role, ...(args.design_task_id ? { design_task_id: args.design_task_id, design_fingerprint: args.design_fingerprint } : {}),
+          ...(role === 'design' ? { design_snapshot_fingerprint: fingerprint } : {}),
+          ...(requiresDesign(g) && role !== 'design' ? { dependency_bindings: taskDependencies(approvedTask(g, args.design_task_id, designSourceAccepted(g))).map(id => {
+            const dependency = latestDesignTaskStep(g, id); return { task_id: id, job: dependency.job, review_id: dependency.review_id };
+          }) } : {}),
           execution, request_id, job: path.join(g.project, '.ai/tasks/request-' + hash(request_id)),
           status: 'dispatch_unknown', rework, created_at: Date.now() };
+        if (role === 'design') beginDesign(g);
         g.steps.push(step); g.operations[args.operation_id] = { fingerprint: opFingerprint, done: false, args };
         save(g, 'execution_intent', { operation_id: args.operation_id, request_id });
       }
-      // Exact replay needs no new source/preparation checks. The bridge owns request identity and execution safety.
+      // Unknown replies retain their original request identity, but revoked design approval
+      // must never let a pending retry start a worker on obsolete instructions.
+      if (requiresDesign(g) && step.role !== 'design') {
+        const design = assertApprovedDesign(g, designSourceAccepted(g));
+        assertSourceContinuity(g, fingerprint);
+        if (step.design_fingerprint !== design.fingerprint) throw new Error('Pending execution refers to a stale approved design');
+        if (!designDependenciesCurrent(g, step)) throw new Error('Pending execution depends on stale or unaccepted prerequisite evidence');
+      }
+      // Exact replay needs no new preparation token. The bridge owns request identity and execution safety.
       let result;
       try {
         result = await bridgeCall(args.action === 'continue' ? 'continue_task' : 'dispatch_task', { ...step.execution, request_id: step.request_id });

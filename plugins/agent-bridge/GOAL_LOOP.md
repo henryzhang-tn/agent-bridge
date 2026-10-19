@@ -3,10 +3,79 @@
 Loop 在单任务执行之上保存总目标、参与者、轮次、消息和验收证据。当前宿主 Agent 负责持续选择下一步，Bridge 执行每一轮并记录状态。可用于“实现 → 评审 → 返修 → 整体验收”。
 
 ```text
-$agent-bridge:loop -w=claude -m=glm-5.3 实现 <目标>，修改范围 <目录>，最多 8 个任务、3 次返修
+$agent-bridge:loop -d=max -w=claude -m=glm-5.3 -e=high 实现 <目标>，修改范围 <目录>，最多 8 个任务、3 次返修
 ```
 
 模型、provider 和 endpoint 以实际发现与预检为准。首次授权覆盖的目的地、项目和范围内可以继续推进；创建目标、收到消息或保存预检记录都不增加授权。
+
+## 下放强度和设计审核
+
+`create_goal / create_parallel_goal` 接收可选的 `delegation_level`，聊天短参数为 `-d`。`low` 由宿主主导设计和实现；默认 `medium` 由宿主设计、worker 实现；`high` 先由 worker 设计，宿主可协助实现；`max` 将分析、设计、拆分、实现、自测和返修全部交给 worker，宿主只审核、提出修改要求、调度和独立验证。强度与 `effort`、并发上限分别配置，创建后固定。旧目标未记录该字段时按 `medium` 处理。
+
+`high / max` 要求登记一个 `mode: "plan"` 的设计 worker。实现者另用 `mode: "edit"` 的参与者，可以使用同一运行时和模型，但不能把设计者的读取权限自动升级。宿主先明确用户目标、范围和完成标准，再让 worker 提出方案与任务图。worker 不自行派发其他 worker。
+
+```mermaid
+flowchart TD
+    U[用户目标、范围和完成标准] --> D[worker 设计与拆分]
+    D --> R{宿主审核具体方案版本}
+    R -->|修改要求| D
+    R -->|通过| W[worker 按获批任务实现与自测]
+    W --> V{宿主检查产物和证据}
+    V -->|返修要求| W
+    V -->|通过| I[串行集成与整体验证]
+```
+
+设计的提交与审核流程如下；所有步骤共用目标的累计预算。
+
+1. 串行目标用 `advance_goal` 派发 `role: "design"` 的只读任务。并行目标先用 `plan_goal_tasks` 添加 `kind: "design", mode: "plan", task_contract.allowed_edits: []` 的任务，再由 worker 认领和执行。任务卡要求 worker 在结果中提供下文的结构化方案。
+2. worker 结束后，宿主检查实际结果并用 `record_review` 验收设计任务。调用 `submit_goal_design`，传入 `goal / operation_id / source_job`；Bridge 从该已验收任务的 `result.md` 读取方案，保存不可变的 `design_fingerprint`。宿主不另外提交一份替代 worker 结果的方案。
+3. 调用 `review_goal_design`，传入 `goal / operation_id / design_fingerprint / checks`。`checks` 使用整体目标的每个 `criterion_id`，但 `verification_kind` 均为 `source`，证据说明方案如何覆盖该标准；记录类型为 `design_coverage`。不通过时必须提供 `feedback`，每项包含 `criterion_id / problem / required_change / verification`。反馈绑定这份方案，worker 根据具体问题修改后重新提交，不能通过改写审核记录替代方案返修。
+4. 获批后，串行 `advance_goal` 的任务同时提供 `role / design_task_id / design_fingerprint`，契约和范围与方案中的该任务一致；预检前把 `Approved design: <fingerprint>` 和 `Design task: <task_id>` 两行加入任务文本。并行 `plan_goal_tasks` 提供该 `design_fingerprint`，按原样登记获批任务；认领返回的 `design_context` 必须在 `prepare_dispatch` 前加入任务文本。声明来自旧版本的任务不能继续启动。
+5. 方案变更前先结束并对账所有活动或状态未知的执行，完成待集成操作。新方案保留已经集成的产物；并行修订使用新的任务 ID，可依赖已集成任务。旧版本未集成任务在新方案获批后退出后续调度，记录和已消耗预算保留。不要直接改写已登记任务，或者另建目标清掉返修与无进展次数。
+
+并行设计返修可以沿用同一设计任务卡，但必须等原 worker 确认结束后创建新的 attempt 和 job，仍消耗返修预算。设计依据派发时的源码，获批后的串行目标也会检查轮次间的源码连续性；目标执行之外的源码改动需要 worker 重新设计并获批。并行集成项目出现外部改动时会保留现场并拒绝继续，应先处理基线冲突。
+
+worker 的输出必须包含且只包含一个 `agent-bridge-design` JSON 代码块，总输出不超过 120 KiB，Bridge 将完整方案保存到 `result.md`。字段为 `summary / decisions / validation_plan / tasks`；任务包含完整的标准 `task_contract`。例如：
+
+````markdown
+```agent-bridge-design
+{
+  "summary": "增加设置持久化，保留已有设置结构。",
+  "decisions": ["沿用项目现有的设置存储入口。"],
+  "validation_plan": ["验证保存、重启、读取以及缺省值行为。"],
+  "tasks": [
+    {
+      "id": "settings-storage",
+      "kind": "implement",
+      "depends_on": [],
+      "read_scope": ["src", "tests"],
+      "mode": "edit",
+      "task_contract": {
+        "complexity": "standard",
+        "context": "现有设置入口位于 src，相关测试位于 tests。",
+        "allowed_edits": ["src/settings.mjs", "tests/settings.test.mjs"],
+        "preserve": ["保留现有设置字段和缺省值"],
+        "integration": "worker 实现与自测，宿主独立验证后集成。",
+        "acceptance_criteria": [
+          {
+            "id": "settings-restart",
+            "description": "设置保存后重新加载仍保留。",
+            "verification": "运行设置持久化测试，覆盖保存、重新加载和缺省值。",
+            "verification_kind": "test"
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+````
+
+方案中的任务 `kind` 为 `implement / research / review`；实现任务使用 `edit`，调研和评审使用 `plan`，评审任务可带 `review_of`。所有依赖、读取范围、修改范围和契约均受目标边界约束。设计任务也消耗步骤预算，返修累计计数，重复方案计入无进展；修改摘要、重启或恢复不能清零预算。方案审核只决定能否按该方案开工，不把整体测试或实际运行标准标记为通过；最终 `record_goal_review` 仍须使用原标准的验证类型检查集成后的代码。
+
+`high / max` 的 `review_goal_task` 和 `record_goal_review` 如有失败或未验证项，同样必须逐项提供 `feedback`。任务反馈绑定对应产物指纹，整体反馈绑定源码快照；记录问题、要求和后续验证方法，让 worker 根据证据返修。宿主执行实际检查后才能更新验收结果。
+
+`max` 允许宿主读代码、运行测试、处理调度和集成已验收产物；宿主认领的任务只能是 `kind: "review", mode: "plan"`，不允许认领设计、调研或实现任务。worker 受阻或预算耗尽时应报告原因与剩余工作，不自动降档、换模型或转为宿主接手。控制器约束 Bridge API 内的操作，Skill 指导宿主在外部工具中的行为；它不提供阻止宿主直接改文件的操作系统沙箱。
 
 ## 串行目标流程
 
@@ -27,8 +96,10 @@ $agent-bridge:loop -w=claude -m=glm-5.3 实现 <目标>，修改范围 <目录>�
 | `send_goal_message` | 主控转发结构化消息，保存来源、回复关系与产物引用 |
 | `read_goal_messages` | 按参与者和游标读取消息，生成用于下一轮任务卡的上下文 |
 | `record_goal_review` | 保存整体目标的逐项证据，验证源码版本并决定验收状态 |
+| `submit_goal_design` | 从本目标已验收的 worker 结果中读取并固定方案 |
+| `review_goal_design` | 审核指定方案指纹，保存结构化修改要求并决定是否允许实现 |
 
-创建目标需要 `goal_id`、`objective`、`context`、`read_scope`、`allowed_edits`、`acceptance_criteria`、`participants` 和 `limits`。参与者固定 `id / worker / provider / model / effort / endpoint / mode`，每轮还必须满足目标读写边界；`plan` 不能升级为 `edit`。例如实现者注册 `edit`、评审者注册 `plan`，两者分别绑定已发现的实际 GLM-5.3 配置。目标范围、参与者、标准和预算创建后冻结。
+创建目标需要 `goal_id`、`objective`、`context`、`read_scope`、`allowed_edits`、`acceptance_criteria`、`participants` 和 `limits`，可设置 `delegation_level`。参与者固定 `id / worker / provider / model / effort / endpoint / mode`，每轮还必须满足目标读写边界；`plan` 不能升级为 `edit`。例如实现者注册 `edit`、设计者和评审者注册 `plan`，分别绑定已发现的实际 GLM-5.3 配置。目标范围、参与者、标准、预算和下放强度创建后冻结。
 
 每轮的 `execution` 使用现有派发参数，包括 `task_contract`、`prepared_ref` 和 `endpoint`；操作 ID 用于区分新工作和重复请求。`continue` 的任务必须已经关联到当前目标和参与者，并保持原任务契约及执行选择。
 
@@ -39,7 +110,7 @@ $agent-bridge:loop -w=claude -m=glm-5.3 实现 <目标>，修改范围 <目录>�
 - 子任务的 `ready_for_review` 只表示执行返回。`record_review` 保存子任务证据，`record_goal_review` 另行验证整体目标。
 - 目标验收绑定声明范围内实际文件内容，能够识别同大小修改、新文件及删除；`.ai` 和 `.git` 的变化不影响源码快照。超出遍历或大小上限会明确拒绝，不接受不完整快照。
 - 验收前从 `goal_status` 获取 `snapshot_fingerprint`，在该版本上执行检查。检查过程中源码变化会拒绝旧指纹，完成后源码变化也会使验收失效。
-- `max_steps` 限制累计派发尝试，包含实现、评审和续接；例如 8 次表示三者合计最多 8 次，同一操作重放不增加次数，启动前被明确拒绝的尝试仍计数。`max_reworks` 统计续接及整体失败验收后的新任务。`max_no_progress` 统计结束时源码未变的轮次和同一源码/检查结论的重复失败验收；证据改写不算进展，后续轮次带来实际源码变化才会清除连续无进展计数。纯分析目标应按预期轮数配置该上限。消息、心跳、改写摘要和重启不能重置预算。
+- `max_steps` 限制累计派发尝试，包含设计、实现、评审和续接；例如 8 次表示这些执行合计最多 8 次，同一操作重放不增加次数，启动前被明确拒绝的尝试仍计数。`max_reworks` 统计续接、方案返修及整体失败验收后的新任务。`max_no_progress` 统计无进展轮次、重复方案和同一源码/检查结论的重复失败验收；证据改写不算进展。纯分析目标应按预期轮数配置该上限。消息、心跳、改写摘要和重启不能重置预算。
 - 可选 `limits.timeout_seconds` 从创建起累计，暂停不会延长；`execution.timeout_seconds` 是独立的单任务预算。达到目标预算后阻止新执行，包括尚未创建任务的未决派发重放；已有任务和最终验收仍可收敛。若需要终止当前任务，单独使用任务时间预算或取消。
 - 暂停保留正在运行的任务，取消会请求停止已有任务并保留部分修改。达到预算、等待输入或取消均不表示目标完成。
 
@@ -55,14 +126,14 @@ $agent-bridge:loop -w=claude -m=glm-5.3 实现 <目标>，修改范围 <目录>�
 
 ## 宿主参与和并行任务
 
-任务较多时，宿主可以执行一个子任务，同时调度多个 worker。建议先设置 `max_parallel_total: 3`、`max_parallel_workers: 2`；实际数量由用户约束、任务独立性和运行资源决定，多个实例不会增加服务商额度。一个参与者同时最多持有一个活动任务。写入范围重叠的任务需要顺序处理，前一份产物集成或被拒绝后才释放范围预约。
+任务较多时，`low / medium / high` 的宿主可以执行一个子任务，同时调度多个 worker；`max` 的宿主负责审核和调度。建议先设置 `max_parallel_total: 3`、`max_parallel_workers: 2`；实际数量由用户约束、任务独立性和运行资源决定，多个实例不会增加服务商额度。一个参与者同时最多持有一个活动任务。写入范围重叠的任务需要顺序处理，前一份产物集成或被拒绝后才释放范围预约。
 
 并行目标用 `create_parallel_goal` 显式创建（schema 2），已有 `create_goal` 保持 schema 1。首期要求干净的 Git 项目，已有修改或非 Git 项目应保留现状并使用串行目标，不自动 stash 或 reset。根目录中被 Git 忽略的本地配置不会复制到 worktree；每个实际工作区都需要独立预检，声明的读写范围不等于操作系统隔离。
 
 | 工具 | 用途 |
 | --- | --- |
 | `create_parallel_goal` | 固定目标、整体标准、参与者、累计预算和并发上限 |
-| `plan_goal_tasks` | 按 `plan_version` 追加任务及依赖；拒绝循环和未知依赖 |
+| `plan_goal_tasks` | 按 `plan_version` 登记任务及依赖；强下放模式绑定获批设计，拒绝循环和未知依赖 |
 | `claim_goal_task` | 原子认领任务、参与者及执行名额，创建独立 worktree |
 | `start_goal_task` | 启动宿主任务，或派发已在实际 worktree 预检的 worker |
 | `submit_goal_task` | 执行结束后提交固定产物，或由宿主确认停止修改 |
@@ -70,12 +141,12 @@ $agent-bridge:loop -w=claude -m=glm-5.3 实现 <目标>，修改范围 <目录>�
 | `integrate_goal_task` | 串行集成通过的产物，验证前像和当前源码 |
 
 1. 参与者必须包含一个 `{ id: "host", kind: "host" }`。worker 使用 `kind: "worker"` 并固定实际发现的 `worker / provider / model / effort / endpoint / mode`。创建字段与串行目标相近，`limits` 额外要求两项并发上限。
-2. 任务包含 `id / kind / depends_on / read_scope / mode / task_contract`，其中 `kind` 为 `implement / research / review`。追加计划要传当前 `plan_version`；已有任务和契约保持不变。普通依赖必须已集成。独立评审用 `kind: "review", mode: "plan", review_of: "<task_id>"`，读取目标任务已提交的产物；不要同时把目标放入 `depends_on`，否则会等待它先集成。
+2. 任务包含 `id / kind / depends_on / read_scope / mode / task_contract`，其中 `kind` 为 `design / implement / research / review`。登记计划要传当前 `plan_version`；已有任务和契约不直接改写。`high / max` 的非设计任务还要绑定获批方案，修订流程见上文。普通依赖必须已集成。独立评审用 `kind: "review", mode: "plan", review_of: "<task_id>"`，读取目标任务已提交的产物；不要同时把目标放入 `depends_on`，否则会等待它先集成。
 3. 认领使用 `task_id / participant_id / owner_session_id / operation_id`。返回 `attempt_id / lease_token / workspace / task_contract / read_scope / mode`。后续启动、提交和集成绑定原会话与 token；状态查询不回传 token，保存它用于当前任务恢复，不能靠会话过期认定旧执行已停止。
 4. 宿主在返回的 `workspace.path` 工作，`start_goal_task` 不传 `execution`。worker 用该路径、返回的契约和范围准备任务，先 `prepare_dispatch`，再把完整结果交给 `start_goal_task.execution`。评审任务还要在预检前将返回的 `review_context` 加入任务文本，绑定被评审产物。
 5. worker 结束后先检查实际结果并调用原 `record_review`，通过后才能 `submit_goal_task`。宿主直接提交自己的产物。`review_goal_task` 接收本次 `artifact_fingerprint` 和逐项检查；宿主编辑任务通过时必须引用 `reviewer_task_id`，由另一个已经结束且独立验收通过的只读 worker 检查同一份产物。
 6. 调用 `integrate_goal_task` 把产物逐项集成回原项目。新 worktree 从原提交加已集成产物建立基线；评审工作区另加入待评审产物。每个任务提交的只是相对自身基线的增量。共享文件变化或冲突会阻止集成，保留现场，不自动覆盖、提交或合并代码。
-7. 所有计划任务都集成后，获取原项目的 `snapshot_fingerprint`，运行整体检查，用 `record_goal_review` 完成目标。子任务通过不能替代整体检查；完成后的源码变化会使旧验收失效。
+7. 当前方案要求的执行任务及保留的历史实现均集成后，获取原项目的 `snapshot_fingerprint`，运行整体检查，用 `record_goal_review` 完成目标。设计任务通过单独的方案审核，不要求提交代码产物；被新方案取代的未集成任务不再阻止完成。子任务通过不能替代整体检查；完成后的源码变化会使旧验收失效。
 
 `goal_status / send_goal_message / read_goal_messages / record_goal_review` 同样用于并行目标。`advance_goal` 对并行目标只处理暂停、恢复、取消、等待输入、上下文更新和对账，拒绝旧的 `dispatch / continue` 动作。子任务返修通过重新认领失败任务创建新尝试，沿用原契约并消耗预算；原尝试和产物保留。
 

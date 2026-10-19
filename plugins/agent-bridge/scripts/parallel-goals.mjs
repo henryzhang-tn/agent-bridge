@@ -5,6 +5,9 @@ import { hostName, endpoint } from './destination.mjs';
 import { validateValue, contractSchema, checksSchema, taskContract, reviewChecks } from './quality.mjs';
 import { goalTools } from './goals.mjs';
 import { inspectProject, createWorkspace, snapshotWorkspace, collectArtifact, integrateArtifact } from './goal-workspaces.mjs';
+import { delegationLevelSchema, taskRoleSchema, level, requiresDesign, delegationState, beginDesign, assertDelegationActor,
+  submitDesign, reviewDesign, assertApprovedDesign, designIsCurrent, assertPlannedTask, designExecutionContext, validateFeedback,
+  feedbackSchema } from './delegation-policy.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 const stable = value => JSON.stringify(value, (_, item) => item && typeof item === 'object' && !Array.isArray(item)
@@ -30,21 +33,21 @@ const ownerProperties = { goal: text(4096), operation_id: opId, task_id: id, att
   owner_session_id: text(200), lease_token: text(64) };
 const ownerRequired = Object.keys(ownerProperties);
 export const parallelSchemas = {
-  create_parallel_goal: object({ project: text(4096), goal_id: id, objective: text(), context: text(), read_scope: paths, allowed_edits: paths,
+  create_parallel_goal: object({ project: text(4096), goal_id: id, objective: text(), context: text(), read_scope: paths, allowed_edits: paths, delegation_level: delegationLevelSchema,
     acceptance_criteria: contractSchema.properties.acceptance_criteria,
     participants: { type: 'array', minItems: 2, maxItems: 32, items: object({ id, kind: { type: 'string', enum: ['host', 'worker'] }, ...workerProperties }, ['id', 'kind']) },
     limits: object({ max_steps: integer(1), max_reworks: integer(0), max_no_progress: integer(1), timeout_seconds: integer(1, 2592000),
       max_parallel_total: integer(1, 32), max_parallel_workers: integer(1, 31) }, ['max_steps', 'max_reworks', 'max_no_progress', 'max_parallel_total', 'max_parallel_workers']),
   }, ['project', 'goal_id', 'objective', 'context', 'read_scope', 'allowed_edits', 'acceptance_criteria', 'participants', 'limits']),
-  plan_goal_tasks: object({ goal: text(4096), operation_id: opId, plan_version: integer(0, 1000), tasks: { type: 'array', minItems: 1, maxItems: 100, items: object({
-    id, kind: { type: 'string', enum: ['implement', 'research', 'review'] }, depends_on: { type: 'array', maxItems: 100, items: id },
+  plan_goal_tasks: object({ goal: text(4096), operation_id: opId, plan_version: integer(0, 1000), design_fingerprint: fingerprintSchema, tasks: { type: 'array', minItems: 1, maxItems: 100, items: object({
+    id, kind: taskRoleSchema, depends_on: { type: 'array', maxItems: 100, items: id },
     read_scope: paths, mode: modeSchema, task_contract: contractSchema, review_of: id,
   }, ['id', 'kind', 'depends_on', 'read_scope', 'mode', 'task_contract']) } }, ['goal', 'operation_id', 'plan_version', 'tasks']),
   claim_goal_task: object({ goal: text(4096), operation_id: opId, task_id: id, participant_id: id, owner_session_id: text(200) }, ['goal', 'operation_id', 'task_id', 'participant_id', 'owner_session_id']),
   start_goal_task: object({ ...ownerProperties, execution: executionSchema }, ownerRequired),
   submit_goal_task: object({ ...ownerProperties, summary: text(12000), outcome: { type: 'string', enum: ['completed', 'cancelled'] } }, [...ownerRequired, 'summary']),
   review_goal_task: object({ goal: text(4096), operation_id: opId, task_id: id, attempt_id: id, artifact_fingerprint: fingerprintSchema,
-    checks: checksSchema, reviewer_task_id: id }, ['goal', 'operation_id', 'task_id', 'attempt_id', 'artifact_fingerprint', 'checks']),
+    checks: checksSchema, reviewer_task_id: id, feedback: feedbackSchema }, ['goal', 'operation_id', 'task_id', 'attempt_id', 'artifact_fingerprint', 'checks']),
   integrate_goal_task: object(ownerProperties, ownerRequired),
 };
 export const parallelTools = Object.entries(parallelSchemas).map(([name, inputSchema]) => ({ name, inputSchema,
@@ -159,7 +162,7 @@ function save(g, event, data = {}) {
 }
 function budget(g) {
   const used = { steps: g.attempts.length, reworks: g.attempts.filter(a => a.rework).length,
-    no_progress: g.tasks.reduce((sum, t) => sum + t.no_progress, 0), seconds: Math.floor((now() - g.created_at) / 1000) };
+    no_progress: g.tasks.reduce((sum, t) => sum + t.no_progress, 0) + (g.design_no_progress || 0), seconds: Math.floor((now() - g.created_at) / 1000) };
   const exhausted = [];
   if (used.steps >= g.limits.max_steps) exhausted.push('max_steps');
   if (used.no_progress >= g.limits.max_no_progress) exhausted.push('max_no_progress');
@@ -176,6 +179,7 @@ function attempt(g, id) { const found = g.attempts.find(a => a.id === id); if (!
 function latest(g, t) { return t.attempt_id ? attempt(g, t.attempt_id) : null; }
 function owns(g, args) {
   const t = task(g, args.task_id); const a = attempt(g, args.attempt_id);
+  if (t.status === 'superseded') throw new Error('Task belongs to a superseded design');
   if (a.task_id !== t.id || a.owner_session_id !== args.owner_session_id || a.lease_token !== args.lease_token) throw new Error('Attempt ownership does not match');
   if (t.attempt_id !== a.id) throw new Error('Attempt was superseded');
   return { t, a };
@@ -190,6 +194,7 @@ function register(g, args, extra = {}) {
 }
 function participants(g, id) { const p = g.participants.find(item => item.id === id); if (!p) throw new Error('Unknown goal participant'); return p; }
 function ready(g, t) {
+  if (t.status === 'superseded') return false;
   if (t.depends_on.some(id => task(g, id).status !== 'integrated')) return false;
   if (t.review_of) { const source = latest(g, task(g, t.review_of)); return !!source?.artifact && ['submitted', 'reviewed', 'integrated'].includes(source.status); }
   return true;
@@ -197,17 +202,46 @@ function ready(g, t) {
 function writable(g) {
   if (stoppedModes.has(g.control) || g.status === 'completed') throw new Error('Goal must be active before new execution');
 }
+function designSourceAccepted(g) {
+  const a = g.design?.source_job && g.attempts.find(item => item.job === g.design.source_job);
+  if (!a || a.kind !== 'worker' || task(g, a.task_id).kind !== 'design'
+    || a.worker_status !== 'ready_for_review' || a.worker_review_status !== 'accepted'
+    || a.worker_review_id !== g.design.source_review_id || !fs.existsSync(path.join(a.job, 'state.json'))) return false;
+  try { return !!a.design_workspace_snapshot && snapshotWorkspace(a.workspace, ['.']) === a.design_workspace_snapshot; }
+  catch { return false; }
+}
+function assertDesignTask(g, t) {
+  if (t.status === 'superseded') throw new Error('Task belongs to a superseded design');
+  if (!requiresDesign(g) || t.kind === 'design') return;
+  const design = assertApprovedDesign(g, designSourceAccepted(g));
+  if (t.design_fingerprint !== design.fingerprint) throw new Error('Task is not bound to the current approved design');
+}
+function designQuiescent(g) {
+  if (capacity(g).total || g.attempts.some(a => a.kind === 'worker' && bridgeActive.has(a.worker_status))) throw new Error('Design changes require every active or uncertain attempt to stop');
+  if (g.operations.some(op => op.type === 'integration' && !op.done)) throw new Error('Design changes require pending integration to complete');
+}
+function requiredTasks(g) { return g.tasks.filter(t => t.status !== 'superseded' && t.kind !== 'design'); }
 function independentReviewer(g, t, a, reviewerTaskId, expectedAttemptId) {
   if (!reviewerTaskId) throw new Error('Host edits require an accepted independent worker review');
   const rt = task(g, reviewerTaskId); const ra = latest(g, rt);
+  // Replanning cannot erase the stopped review evidence of an already integrated host artifact.
+  const retainedEvidence = t.status === 'integrated' && rt.status === 'superseded' && ra?.status === 'superseded' && expectedAttemptId === ra.id;
   if (rt.kind !== 'review' || rt.mode !== 'plan' || rt.review_of !== t.id || !ra || ra.kind !== 'worker'
     || ra.worker_status !== 'ready_for_review' || ra.worker_review_status !== 'accepted'
-    || !['submitted', 'reviewed', 'integrated'].includes(ra.status) || ra.input_artifact_fingerprint !== a.artifact.fingerprint
+    || (!retainedEvidence && !['submitted', 'reviewed', 'integrated'].includes(ra.status)) || ra.input_artifact_fingerprint !== a.artifact.fingerprint
     || expectedAttemptId && expectedAttemptId !== ra.id) throw new Error('Independent reviewer must remain accepted and bound to this artifact');
   requireSnapshot(ra, rt); return ra;
 }
 function allTasksAccepted(g) {
-  return g.tasks.length > 0 && g.tasks.every(t => {
+  if (requiresDesign(g)) {
+    if (!designIsCurrent(g, designSourceAccepted(g))) return false;
+    for (const spec of g.design.tasks) {
+      const planned = g.tasks.find(t => t.id === spec.id);
+      if (!planned || planned.design_fingerprint !== g.design.fingerprint || planned.status !== 'integrated') return false;
+    }
+  }
+  const obligations = requiredTasks(g);
+  return obligations.length > 0 && obligations.every(t => {
     const a = latest(g, t);
     if (a?.kind === 'host' && t.mode === 'edit') {
       try { independentReviewer(g, t, a, a.review?.reviewer_task_id, a.review?.reviewer_attempt_id); } catch { return false; }
@@ -220,14 +254,14 @@ function refreshStatus(g, fingerprint) {
   if (g.review?.status === 'accepted' && (g.review.snapshot_fingerprint !== fingerprint || !allTasksAccepted(g))) {
     g.review = { ...g.review, status: 'stale' };
   }
-  for (const t of g.tasks) if (!t.attempt_id) t.status = ready(g, t) ? 'ready' : 'waiting_dependencies';
+  for (const t of g.tasks) if (!t.attempt_id && t.status !== 'superseded') t.status = ready(g, t) ? 'ready' : 'waiting_dependencies';
   if (g.control === 'cancelled') g.status = capacity(g).total ? 'cancelling' : 'cancelled';
   else if (stoppedModes.has(g.control)) g.status = g.control;
   else if (g.review?.status === 'accepted') g.status = 'completed';
   else if (capacity(g).total) g.status = 'running';
   else if (budget(g).exhausted.length) g.status = 'budget_exhausted';
-  else if (g.tasks.some(t => t.status === 'changes_requested')) g.status = 'rework';
-  else if (g.tasks.length && g.tasks.every(t => t.status === 'integrated')) g.status = 'reviewing';
+  else if (g.design_phase === 'changes_requested' || requiredTasks(g).some(t => t.status === 'changes_requested')) g.status = 'rework';
+  else if (requiredTasks(g).length && requiredTasks(g).every(t => t.status === 'integrated')) g.status = 'reviewing';
   else g.status = 'ready';
 }
 function snapshot(g) { return snapshotWorkspace(g.project, g.read_scope); }
@@ -238,6 +272,7 @@ function observedSnapshot(g, tolerate = false) {
 function response(g, fingerprint = g.snapshot_error ? null : snapshot(g)) {
   refreshStatus(g, fingerprint);
   return { schema: 2, goal: g.goal, goal_id: g.goal_id, project: g.project, host: g.host, objective: g.objective, status: g.status,
+    ...delegationState(g),
     plan_version: g.plan_version, context_version: g.context_version, context: g.shared_context, participants: g.participants,
     acceptance_criteria: g.acceptance_criteria, read_scope: g.read_scope, allowed_edits: g.allowed_edits,
     snapshot_fingerprint: fingerprint, snapshot_error: g.snapshot_error || null, review: g.review, capacity: capacity(g), budget: budget(g),
@@ -267,7 +302,7 @@ function applyStatuses(g, updates) {
     const a = attempt(g, update.id); const state = update.state; const t = task(g, a.task_id);
     a.worker_status = state.status; a.worker_review_status = state.quality?.acceptanceStatus || state.review?.status || 'pending';
     a.worker_review_id = state.review?.id || null;
-    if (['submitted', 'reviewed', 'integrated', 'changes_requested'].includes(a.status)) continue;
+    if (['submitted', 'reviewed', 'integrated', 'changes_requested', 'superseded'].includes(a.status)) continue;
     if (bridgeActive.has(state.status)) a.status = g.control === 'cancelled' ? 'cancelling' : state.status === 'orphaned' ? 'orphaned' : 'running';
     else if (endedBridge.has(state.status)) {
       a.status = state.status === 'ready_for_review' ? 'worker_ended' : 'failed';
@@ -298,13 +333,14 @@ async function create(args) {
   }
   if (new Set(args.acceptance_criteria.map(c => c.id)).size !== args.acceptance_criteria.length) throw new Error('Duplicate goal acceptance criterion');
   if (args.limits.max_parallel_workers > args.limits.max_parallel_total) throw new Error('Worker capacity cannot exceed total capacity');
+  if (requiresDesign(args) && !args.participants.some(p => p.kind === 'worker' && p.mode === 'plan')) throw new Error('high/max delegation requires a read-only plan worker for design');
   const contract = { ...args, project, read_scope, allowed_edits, participants: args.participants.map(p => p.kind === 'worker' ? { ...p, endpoint: endpoint(p.endpoint) } : p) };
   for (const dir of [path.join(project, '.ai'), path.join(project, '.ai/goals'), path.join(project, '.ai/goals', args.goal_id)]) directory(dir);
   const goal = path.join(project, '.ai/goals', args.goal_id);
   return lock(goal, async () => {
     if (fs.existsSync(path.join(goal, 'goal.json'))) { const g = location(goal); if (g.contract_fingerprint !== digest(contract)) throw new Error('goal_id conflicts with the existing contract'); return { ...response(g), reused: true }; }
     let base; try { base = inspectProject(project); } catch (error) { throw new Error(error.message + '; use create_goal for a serial goal, or first prepare a clean Git project. Existing changes were preserved.'); }
-    const g = { schema: 2, ...contract, goal, host: hostName(), contract_fingerprint: digest(contract), base,
+    const g = { schema: 2, ...contract, delegation_level: level(args), goal, host: hostName(), contract_fingerprint: digest(contract), base,
       created_at: now(), updated_at: now(), status: 'ready', control: 'active', tasks: [], attempts: [], operations: [], reviews: [], messages: [], events: [],
       plan_version: 0, context_version: 1, shared_context: { facts: [], decisions: [], open_questions: [], summary: args.context }, review: null,
       integration_fingerprint: snapshotWorkspace(project, ['.']), integrated_artifacts: [] };
@@ -314,6 +350,10 @@ async function create(args) {
 function validatePlan(g, args) {
   if (args.plan_version !== g.plan_version) throw new Error('plan_version changed; inspect the current plan before appending');
   if (g.tasks.length + args.tasks.length > 100) throw new Error('Goal task limit reached');
+  const needsApproval = requiresDesign(g) && args.tasks.some(t => t.kind !== 'design');
+  const sourceAccepted = needsApproval && designSourceAccepted(g);
+  const design = needsApproval ? assertApprovedDesign(g, sourceAccepted) : null;
+  if (design && args.design_fingerprint !== design.fingerprint) throw new Error('plan_goal_tasks must bind the exact approved design fingerprint');
   const existing = new Set(g.tasks.map(t => t.id)); const tasks = args.tasks.map(input => {
     if (existing.has(input.id)) throw new Error('Task ID already exists; planned tasks are immutable'); existing.add(input.id);
     const read_scope = scopes(g.project, input.read_scope);
@@ -323,11 +363,18 @@ function validatePlan(g, args) {
     if (contract.allowed_edits.some(item => !within(item, g.allowed_edits))) throw new Error('Task edit scope exceeds the goal');
     if (new Set(input.depends_on).size !== input.depends_on.length) throw new Error('Duplicate dependency');
     if (input.review_of && (input.kind !== 'review' || input.mode !== 'plan')) throw new Error('Independent review tasks must use kind review and plan mode');
+    if (input.kind === 'design' && (input.mode !== 'plan' || input.depends_on.length || input.review_of)) throw new Error('Design tasks must be read-only and independent of execution tasks');
+    let design_fingerprint;
+    if (design && input.kind !== 'design') {
+      assertPlannedTask(g, { ...input, read_scope, task_contract: contract }, sourceAccepted);
+      design_fingerprint = design.fingerprint;
+    }
     return { id: input.id, kind: input.kind, depends_on: input.depends_on, read_scope, mode: input.mode, contract,
+      ...(design_fingerprint ? { design_fingerprint } : {}),
       ...(input.review_of ? { review_of: input.review_of } : {}), status: 'waiting_dependencies', attempt_id: null, no_progress: 0, outcomes: [] };
   });
   const all = [...g.tasks, ...tasks]; const byId = new Map(all.map(t => [t.id, t]));
-  for (const t of tasks) for (const dep of [...t.depends_on, ...(t.review_of ? [t.review_of] : [])]) if (!byId.has(dep) || dep === t.id) throw new Error('Unknown or self dependency');
+  for (const t of tasks) for (const dep of [...t.depends_on, ...(t.review_of ? [t.review_of] : [])]) if (!byId.has(dep) || byId.get(dep).status === 'superseded' || dep === t.id) throw new Error('Unknown, superseded or self dependency');
   const visiting = new Set(); const visited = new Set();
   function visit(t) { if (visiting.has(t.id)) throw new Error('Task dependency cycle'); if (visited.has(t.id)) return; visiting.add(t.id);
     for (const dep of [...t.depends_on, ...(t.review_of ? [t.review_of] : [])]) visit(byId.get(dep)); visiting.delete(t.id); visited.add(t.id); }
@@ -346,9 +393,11 @@ function claimResult(g, a, reused) {
   return { ...response(g), reused, task_id: a.task_id, attempt_id: a.id, lease_token: a.lease_token, owner_session_id: a.owner_session_id,
     task_contract: task(g, a.task_id).contract, read_scope: task(g, a.task_id).read_scope, mode: task(g, a.task_id).mode,
     workspace: a.workspace, input_artifact_fingerprint: a.input_artifact_fingerprint || null,
+    design_context: task(g, a.task_id).design_fingerprint ? designExecutionContext(g, a.task_id) : null,
     review_context: a.input_artifact_fingerprint ? 'Review artifact: ' + a.input_artifact_fingerprint : null };
 }
 function validateStart(g, t, a, execution) {
+  assertDelegationActor(g, { kind: a.kind, role: t.kind, mode: t.mode }); assertDesignTask(g, t);
   if (a.kind === 'host') { if (execution !== undefined) throw new Error('Host start must omit execution'); return; }
   if (!execution) throw new Error('Worker start requires a prepared execution');
   const p = participants(g, a.participant_id);
@@ -358,6 +407,7 @@ function validateStart(g, t, a, execution) {
   if (digest(scopes(a.workspace.path, execution.read_scope)) !== digest(t.read_scope)) throw new Error('Execution must preserve task read scope');
   if (digest(taskContract(execution.task_contract, { mode: t.mode, readScope: t.read_scope })) !== digest(t.contract)) throw new Error('Execution must preserve task contract');
   if (a.input_artifact_fingerprint && !execution.task.includes('Review artifact: ' + a.input_artifact_fingerprint)) throw new Error('Review task text must include the exact artifact marker before prepare_dispatch');
+  if (t.design_fingerprint && !execution.task.includes(designExecutionContext(g, t.id))) throw new Error('Worker task text must include the exact approved design marker before prepare_dispatch');
 }
 function taskOutcome(t, a, checks) {
   const outcome = digest({ artifact: a.artifact.progress_fingerprint || a.artifact.fingerprint, checks: checks.map(({ criterion_id, status, verification_kind }) => ({ criterion_id, status, verification_kind })).sort((x, y) => x.criterion_id.localeCompare(y.criterion_id)) });
@@ -454,8 +504,9 @@ export async function callParallelGoalTool(name, args, bridgeCall) {
       if (args.snapshot_fingerprint !== fp) throw new Error('Integration snapshot changed; inspect it and review again');
       if (capacity(g).total) throw new Error('Goal review requires every active or uncertain attempt to stop');
       const checks = reviewChecks({ acceptance_criteria: g.acceptance_criteria }, args.checks); const accepted = checks.every(c => c.status === 'passed');
+      validateFeedback(checks, args.feedback, requiresDesign(g));
       if (accepted && (g.control === 'cancelled' || !allTasksAccepted(g))) throw new Error('Goal completion requires every planned task to be integrated');
-      const record = { review_id: args.review_id, snapshot_fingerprint: fp, checks, status: accepted ? 'accepted' : checks.some(c => c.status === 'failed') ? 'changes_requested' : 'incomplete' };
+      const record = { review_id: args.review_id, snapshot_fingerprint: fp, checks, ...(args.feedback ? { feedback: args.feedback } : {}), status: accepted ? 'accepted' : checks.some(c => c.status === 'failed') ? 'changes_requested' : 'incomplete' };
       const previous = g.reviews.find(r => r.review_id === args.review_id);
       if (previous && previous.fingerprint !== digest(record)) throw new Error('review_id conflicts with its saved review');
       if (!previous) { g.review = { ...record, fingerprint: digest(record), at: now() }; g.rework_required = !accepted; g.reviews.push(g.review); save(g, 'goal_review'); }
@@ -465,6 +516,30 @@ export async function callParallelGoalTool(name, args, bridgeCall) {
     if (previous?.done) {
       if (name === 'claim_goal_task') return claimResult(g, attempt(g, previous.attempt_id), true);
       return { ...response(g, fp), reused: true };
+    }
+    if (name === 'submit_goal_design') {
+      writable(g); designQuiescent(g); checkIntegrationSource(g);
+      const a = g.attempts.find(item => item.job === args.source_job);
+      if (!a || a.kind !== 'worker' || task(g, a.task_id).kind !== 'design' || task(g, a.task_id).mode !== 'plan'
+        || a.worker_status !== 'ready_for_review' || a.worker_review_status !== 'accepted'
+        || a.id !== g.design_source_attempt_id) throw new Error('Design submission requires the latest ended and independently accepted design worker attempt');
+      if (a.source_fingerprint !== g.integration_fingerprint) throw new Error('Integration source changed since the design worker started; obtain a fresh worker design');
+      if (!a.design_workspace_snapshot || snapshotWorkspace(a.workspace, ['.']) !== a.design_workspace_snapshot) throw new Error('Read-only design workspace changed; obtain a fresh worker design');
+      submitDesign(g, args, { source_job: a.job, source_id: a.id, source_review_id: a.worker_review_id, snapshot_fingerprint: fp });
+      register(g, args, { done: true }); save(g, 'design_submitted', { attempt_id: a.id }); return response(g, fp);
+    }
+    if (name === 'review_goal_design') {
+      writable(g); designQuiescent(g); checkIntegrationSource(g);
+      const design = reviewDesign(g, args, { sourceAccepted: designSourceAccepted(g), snapshot_fingerprint: fp });
+      if (design.status === 'approved' && g.applied_design_fingerprint !== design.fingerprint) {
+        if (requiresDesign(g)) for (const t of g.tasks) if (t.kind !== 'design' && !['integrated', 'superseded'].includes(t.status)) {
+          t.status = 'superseded'; t.superseded_by_design = design.fingerprint;
+          const a = latest(g, t); if (a) { a.status = 'superseded'; a.superseded_by_design = design.fingerprint; }
+        }
+        g.applied_design_fingerprint = design.fingerprint; g.plan_version++;
+      }
+      g.review = g.review ? { ...g.review, status: 'stale' } : null;
+      register(g, args, { done: true }); save(g, 'design_reviewed'); return response(g, fp);
     }
     if (name === 'plan_goal_tasks') {
       writable(g); const tasks = validatePlan(g, args); g.tasks.push(...tasks); g.plan_version++; g.review = g.review ? { ...g.review, status: 'stale' } : null;
@@ -477,7 +552,10 @@ export async function callParallelGoalTool(name, args, bridgeCall) {
       if (!previous) {
         const b = budget(g); if (b.exhausted.length) throw new Error('Goal budget exhausted: ' + b.exhausted.join(', '));
         const t = task(g, args.task_id); const p = participants(g, args.participant_id); const prior = latest(g, t);
-        if (prior && !['changes_requested', 'failed', 'dispatch_rejected', 'cancelled'].includes(prior.status)) throw new Error('Task already has a reserved or completed attempt');
+        assertDelegationActor(g, { kind: p.kind, role: t.kind, mode: t.mode }); assertDesignTask(g, t);
+        if (t.kind === 'design') designQuiescent(g);
+        const stoppedDesign = t.kind === 'design' && ['worker_ended', 'submitted', 'reviewed', 'integrated'].includes(prior?.status) && endedBridge.has(prior.worker_status);
+        if (prior && !stoppedDesign && !['changes_requested', 'failed', 'dispatch_rejected', 'cancelled'].includes(prior.status)) throw new Error('Task already has a reserved or completed attempt');
         if (!ready(g, t)) throw new Error('Task dependencies are not integrated or review input is not submitted');
         if (p.kind === 'worker' && p.mode !== t.mode) throw new Error('Participant mode differs from the task');
         if (t.review_of && p.kind !== 'worker') throw new Error('Independent review must be assigned to a worker');
@@ -488,7 +566,7 @@ export async function callParallelGoalTool(name, args, bridgeCall) {
             && t.contract.allowed_edits.some(edit => other.contract.allowed_edits.some(held => within(edit, [held]) || within(held, [edit])));
         })) throw new Error('Task edit scope overlaps another unintegrated writer; integrate or reject that artifact first');
         const c = capacity(g); if (c.total >= c.max_total || p.kind === 'worker' && c.workers >= c.max_workers) throw new Error('Goal parallel capacity is full');
-        const rework = !!prior || !!g.rework_required;
+        const rework = !!prior || !!g.rework_required || t.kind === 'design' && g.attempts.some(item => task(g, item.task_id).kind === 'design');
         if (rework && b.used.reworks >= g.limits.max_reworks) throw new Error('Goal rework budget exhausted');
         checkIntegrationSource(g);
         const inputArtifacts = artifactInputs(g, t); const source = t.review_of ? latest(g, task(g, t.review_of)) : null;
@@ -497,12 +575,14 @@ export async function callParallelGoalTool(name, args, bridgeCall) {
           created_at: now(), context_version: g.context_version, source_fingerprint: g.integration_fingerprint,
           dependencies: t.depends_on.map(id => ({ task_id: id, artifact_fingerprint: latest(g, task(g, id)).artifact.fingerprint })),
           input_artifacts: inputArtifacts.map(item => item.fingerprint), input_artifact_fingerprint: source?.artifact.fingerprint || null };
+        if (t.kind === 'design') { beginDesign(g); g.design_source_attempt_id = a.id; g.review = g.review ? { ...g.review, status: 'stale' } : null; }
         g.attempts.push(a); t.attempt_id = a.id; t.status = 'reserved'; register(g, args, { attempt_id: a.id }); save(g, 'claim_reserved', { attempt_id: a.id });
       }
       // Workspace creation is local and idempotent. A crash retains the slot and exact claim identity.
       const t = task(g, a.task_id); const artifacts = a.input_artifacts.map(fp => { const item = g.attempts.find(item => item.artifact?.fingerprint === fp); if (!item) throw new Error('Missing frozen input artifact'); return item.artifact; });
       try { a.workspace = createWorkspace({ project: g.project, goal: g.goal, workspace_id: a.id, base_revision: g.base.base_revision, input_artifacts: artifacts }); }
       catch (error) { a.status = 'failed'; a.error = error.message.slice(0, 1000); t.status = 'failed'; g.operations.find(o => o.id === args.operation_id).done = true; save(g, 'workspace_failed', { attempt_id: a.id }); throw error; }
+      if (t.kind === 'design') a.design_workspace_snapshot = snapshotWorkspace(a.workspace, ['.']);
       a.status = 'reserved'; g.operations.find(o => o.id === args.operation_id).done = true; save(g, 'workspace_ready', { attempt_id: a.id }); return claimResult(g, a, false);
     }
     if (name === 'submit_goal_task') {
@@ -513,6 +593,7 @@ export async function callParallelGoalTool(name, args, bridgeCall) {
         a.status = 'cancelled'; a.stopped_at = now(); t.status = 'cancelled'; register(g, args, { done: true }); save(g, 'host_stopped'); return response(g);
       }
       if (g.control === 'cancelled') throw new Error('Cancelled goal accepts stopped acknowledgments only');
+      assertDesignTask(g, t);
       if (a.kind === 'host' && a.status !== 'running') throw new Error('Host attempt must be running before submission');
       if (a.kind === 'worker' && (a.status !== 'worker_ended' || a.worker_status !== 'ready_for_review' || a.worker_review_status !== 'accepted')) throw new Error('Worker submission requires ended execution and an independent accepted task review');
       if (a.submission_operation_id && a.submission_operation_id !== args.operation_id) throw new Error('Submission is pending; retry its original operation');
@@ -525,16 +606,20 @@ export async function callParallelGoalTool(name, args, bridgeCall) {
     }
     if (name === 'review_goal_task') {
       const t = task(g, args.task_id); const a = attempt(g, args.attempt_id);
+      assertDesignTask(g, t);
       if (a.task_id !== t.id || t.attempt_id !== a.id || !a.artifact || !['submitted', 'reviewed', 'changes_requested'].includes(a.status)) throw new Error('Task review requires the latest submitted, stopped attempt');
       if (a.artifact.fingerprint !== args.artifact_fingerprint) throw new Error('Artifact fingerprint changed'); requireSnapshot(a, t);
       const checks = reviewChecks(t.contract, args.checks); const accepted = checks.every(c => c.status === 'passed');
+      validateFeedback(checks, args.feedback, requiresDesign(g));
       const reviewer = accepted && a.kind === 'host' && t.mode === 'edit' ? independentReviewer(g, t, a, args.reviewer_task_id) : null;
       const outcome = taskOutcome(t, a, checks); a.review = { checks, status: accepted ? 'accepted' : 'changes_requested', artifact_fingerprint: a.artifact.fingerprint,
+        ...(args.feedback ? { feedback: args.feedback } : {}),
         reviewer_task_id: args.reviewer_task_id || null, reviewer_attempt_id: reviewer?.id || null, at: now(), outcome_fingerprint: outcome };
       a.status = accepted ? 'reviewed' : 'changes_requested'; t.status = a.status; register(g, args, { done: true }); save(g, 'task_review', { attempt_id: a.id }); return response(g);
     }
     if (name === 'integrate_goal_task') {
       const { t, a } = owns(g, args);
+      assertDesignTask(g, t);
       if (g.control === 'cancelled') throw new Error('Cancelled goal cannot integrate artifacts');
       if (a.status !== 'reviewed' || a.review?.status !== 'accepted') throw new Error('Integration requires an accepted task artifact'); requireSnapshot(a, t);
       if (a.kind === 'worker' && (a.worker_status !== 'ready_for_review' || a.worker_review_status !== 'accepted')) throw new Error('Worker task review must remain accepted before integration');

@@ -1,12 +1,13 @@
 # 核心实现
 
-使用方法和流程图见 [主 README](../../README.md)。宿主负责拆任务、选择 worker/model/effort、核对用户授权和最终验收；worker 不继续委派。
+使用方法和流程图见 [主 README](../../README.md)。宿主按目标下放强度安排工作，选择 worker/model/effort、核对用户授权和最终验收；`high / max` 的方案与任务拆分由 worker 提出，宿主审核。worker 不继续委派。
 
 | 文件 | 职责 |
 | --- | --- |
-| `scripts/mcp-server.mjs` | 23 个 MCP 工具、参数校验 |
+| `scripts/mcp-server.mjs` | 25 个 MCP 工具、参数校验 |
 | `scripts/goals.mjs` | 目标状态、串行决策、主控消息转发、累计预算与源码版本验收 |
 | `scripts/parallel-goals.mjs` | 并行目标、任务依赖、宿主与 worker 认领、产物评审与调度恢复 |
+| `scripts/delegation-policy.mjs` | 下放强度、worker 方案读取、版本绑定、设计覆盖审核和结构化反馈 |
 | `scripts/goal-workspaces.mjs` | 独立 Git worktree、源码基线、产物范围检查与串行集成 |
 | `scripts/quality.mjs` | 任务标准校验、推理建议、验收证据规则和质量状态 |
 | `scripts/destination.mjs` / `codex-config.mjs` | 本地解析实际 provider/endpoint（Codex 使用其生效配置和登录类型），显式识别宿主 |
@@ -34,6 +35,8 @@ Codex 通过本地 app-server 的 `config/read` 与 `account/read` 解析项目�
 ## 调用约定
 
 聊天调用支持短参数：`$agent-bridge:dispatch -w=zcode -m=GLM-5.3 -e=high <任务>`。`-w / -m / -e` 分别对应 `worker / model / effort`，可省略，支持空格、英文或中文逗号分隔。宿主把短参数映射到 MCP 完整字段；CLI 仍使用现有长参数。
+
+目标循环另外支持 `$agent-bridge:loop -d=max -w=claude -m=glm-5.3 -e=high <目标>`。`-d` 对应创建目标时的 `delegation_level`，可选 `low / medium / high / max`，默认 `medium`；与推理强度和并发数量分别设置。`high / max` 通过 `submit_goal_design / review_goal_design` 审核 worker 的方案，后续任务绑定获批版本。`max` 的宿主只审核、调度和验证，不能接手设计或实现。具体格式、返修和恢复规则见 [Goal Loop](GOAL_LOOP.md#下放强度和设计审核)。
 
 `-f` 由宿主识别，表示用户预授权本次任务使用所选 worker 当前配置的模型服务及任务相关范围。仍须预检并说明实际目的地、项目、范围和模式，再直接派发；目的地或范围变化时重新核对。仅重新预检（目的地与范围不变）不需要重新询问已足够的直接授权。它不传入 MCP 或 CLI，也不改变系统审批、worker 交互阻塞或凭据保护。
 

@@ -163,7 +163,8 @@ function fixture(t, { logsInMetadata = false } = {}) {
 const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
 let selection;
 const models=['GLM-5.3','GLM-5.3-Flash'].map(modelId=>({ref:{providerId:'fixture',modelId},providerLabel:'Synthetic',reasoning:{levels:['low','high','max'].map(value=>({value}))}}));
-const snapshot=()=>({session:{sessionId:'sess_fake',status:'idle'},settings:{model:{current:selection||models[0].ref,available:models}},projection:{status:'idle'},messages:[{info:{role:'assistant'},parts:[{type:'text',text:'Synthetic result for '+selection?.modelId}]}]});
+const reply=()=>fs.existsSync(new URL('fixture-response.txt',import.meta.url))?fs.readFileSync(new URL('fixture-response.txt',import.meta.url),'utf8'):'Synthetic result for '+selection?.modelId;
+const snapshot=()=>({session:{sessionId:'sess_fake',status:'idle'},settings:{model:{current:selection||models[0].ref,available:models}},projection:{status:'idle'},messages:[{info:{role:'assistant'},parts:[{type:'text',text:reply()}]}]});
 readline.createInterface({input:process.stdin}).on('line',line=>{
  const m=JSON.parse(line);const logPath=new URL(${JSON.stringify(logRelative)},import.meta.url);fs.mkdirSync(new URL('.',logPath),{recursive:true});fs.appendFileSync(logPath,JSON.stringify(m)+'\\n');
  if(m.method==='session/create')send({id:m.id,result:snapshot()});
@@ -231,6 +232,59 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   };
   return { root, rpc, call, requestLog, dispatch, args, config, jobs };
 }
+
+test('max delegation MCP loop preserves a large worker design, approves coverage and executes only its bound tasks', async t => {
+  const f = fixture(t), project = fs.realpathSync(f.root);
+  const call = async (name, args) => { const r = await f.call(name, args); assert.equal(r.isError, false, r.content?.[0]?.text); return r.structuredContent; };
+  const contract = { ...qualityContract(), acceptance_criteria: qualityContract().acceptance_criteria.slice(0, 1) };
+  const checks = reviewChecks().slice(0, 1);
+  const proposal = { summary: 'Research the bounded fixture', decisions: Array.from({ length: 4 }, (_, i) => 'Decision ' + i + ': ' + 'context '.repeat(500)),
+    validation_plan: ['Inspect actual synthetic result'], tasks: [{ id: 'inspect', kind: 'research', mode: 'plan', read_scope: [], depends_on: [], task_contract: contract }] };
+  const body = '```agent-bridge-design\n' + JSON.stringify(proposal) + '\n```';
+  assert.ok(body.length > 12000);
+  fs.writeFileSync(path.join(project, 'fixture-response.txt'), body);
+  const prepared = await call('prepare_dispatch', { ...f.args, project, task_contract: contract });
+  const goal = (await call('create_goal', { project, goal_id: 'max-mcp', delegation_level: 'max', objective: 'Research the synthetic fixture', context: 'No real model or private source',
+    read_scope: [], allowed_edits: [], acceptance_criteria: contract.acceptance_criteria,
+    participants: [{ id: 'worker', worker: f.args.worker, provider: f.args.provider, model: f.args.model, effort: 'high', mode: 'plan', endpoint: prepared.destination.endpoint }],
+    limits: { max_steps: 4, max_reworks: 2, max_no_progress: 3 } })).goal;
+  const execution = { ...f.args, project, task_contract: contract, prepared_ref: prepared.preparedRef, endpoint: prepared.destination.endpoint };
+  const premature = await f.call('advance_goal', { goal, operation_id: 'premature', action: 'dispatch', participant_id: 'worker', role: 'research', execution });
+  assert.equal(premature.isError, true); assert.match(premature.content[0].text, /approval/);
+  const started = await call('advance_goal', { goal, operation_id: 'design', action: 'dispatch', participant_id: 'worker', role: 'design', execution });
+  const job = started.steps.at(-1).job; f.jobs.push(job);
+  assert.equal((await call('task_status', { job, wait_seconds: 3 })).status, 'ready_for_review');
+  assert.equal(fs.readFileSync(path.join(job, 'result.md'), 'utf8').trim(), body);
+  await call('record_review', { job, review_id: 'design-result', checks });
+  const submitted = await call('submit_goal_design', { goal, operation_id: 'submit-design', source_job: job });
+  assert.equal(submitted.design.tasks[0].id, 'inspect');
+  const designFingerprint = submitted.design.fingerprint;
+  const approved = await call('review_goal_design', { goal, operation_id: 'approve-design', design_fingerprint: designFingerprint, checks });
+  assert.equal(approved.design.status, 'approved');
+  fs.writeFileSync(path.join(project, 'fixture-response.txt'), 'Inspected synthetic fixture');
+  const selected = { ...f.args, project, task_contract: contract, task: 'Inspect fixture.\nApproved design: ' + designFingerprint + '\nDesign task: inspect' };
+  const workPrepared = await call('prepare_dispatch', selected);
+  const work = await call('advance_goal', { goal, operation_id: 'inspect', action: 'dispatch', participant_id: 'worker', role: 'research',
+    design_fingerprint: designFingerprint, design_task_id: 'inspect', execution: { ...selected, prepared_ref: workPrepared.preparedRef, endpoint: workPrepared.destination.endpoint } });
+  const workJob = work.steps.at(-1).job; f.jobs.push(workJob);
+  await call('task_status', { job: workJob, wait_seconds: 3 });
+  await call('record_review', { job: workJob, review_id: 'work-verified', checks });
+  const status = await call('goal_status', { goal });
+  const complete = await call('record_goal_review', { goal, review_id: 'final', snapshot_fingerprint: status.snapshot_fingerprint, checks });
+  assert.equal(complete.status, 'completed'); assert.equal(complete.delegation_level, 'max');
+  assert.equal(complete.budget.used.steps, 2);
+  assert.equal(f.requestLog().filter(r => r.method === 'session/send').length, 2);
+});
+
+test('oversized structured worker designs require rework instead of accepting a truncated proposal', async t => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.root, 'fixture-response.txt'), '```agent-bridge-design\n' + 'x'.repeat(121 * 1024) + '\n```');
+  const job = (await f.dispatch({ task_contract: qualityContract() })).structuredContent.job;
+  const ended = (await f.call('task_status', { job, wait_seconds: 3 })).structuredContent;
+  assert.equal(ended.status, 'needs_attention'); assert.match(ended.error, /120 KiB/);
+  assert.ok(fs.statSync(path.join(job, 'result.md')).size < 1000);
+  assert.equal((await f.call('record_review', { job, review_id: 'cannot-accept', checks: reviewChecks() })).isError, true);
+});
 
 test('parallel MCP loop runs host and two workers, reviews host artifact and accepts the integrated version', async t => {
   const f = fixture(t, { logsInMetadata: true }), project = fs.realpathSync(f.root);

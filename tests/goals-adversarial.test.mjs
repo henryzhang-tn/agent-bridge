@@ -87,7 +87,7 @@ function execution(f, changes = {}) {
 }
 
 test('goal tools expose strict schemas and the supported protocol only', () => {
-  assert.deepEqual(goalTools.map(x => x.name).sort(), ['advance_goal', 'create_goal', 'goal_status', 'read_goal_messages', 'record_goal_review', 'send_goal_message']);
+  assert.deepEqual(goalTools.map(x => x.name).sort(), ['advance_goal', 'create_goal', 'goal_status', 'read_goal_messages', 'record_goal_review', 'review_goal_design', 'send_goal_message', 'submit_goal_design']);
   for (const tool of goalTools) {
     assert.equal(tool.inputSchema.type, 'object', tool.name);
     assert.equal(tool.inputSchema.additionalProperties, false, tool.name);

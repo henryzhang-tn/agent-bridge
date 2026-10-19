@@ -476,7 +476,16 @@ function acceptResult(s, result) {
   if (s.notes.length) s.status = 'needs_attention';
   s.error = s.status === 'needs_attention' ? s.notes.join('; ') || 'Worker reported an incomplete or failed task.' : null;
   const response = redact(result.response);
-  atomic(path.join(s.job, 'result.md'), response.slice(0, 12000) + (response.length > 12000 ? '\n\n[Summary truncated; full response is in adapter-result.json or output.json.]\n' : '\n') + (s.notes.length ? '\nBlockers: ' + s.notes.join('; ') + '\n' : ''));
+  // Structured designs must remain whole: host acceptance fingerprints this exact file.
+  // Reject an oversized design instead of silently accepting a truncated task graph.
+  const isDesign = /^```agent-bridge-design[ \t]*\r?$/m.test(response);
+  if (isDesign && Buffer.byteLength(response) > 120 * 1024) {
+    s.status = 'needs_attention'; s.error = 'Structured design exceeds 120 KiB; request a smaller bounded proposal.';
+    atomic(path.join(s.job, 'result.md'), s.error + '\n');
+  } else {
+    const body = isDesign ? response : response.slice(0, 12000);
+    atomic(path.join(s.job, 'result.md'), body + (!isDesign && response.length > 12000 ? '\n\n[Summary truncated; full response is in adapter-result.json or output.json.]\n' : '\n') + (s.notes.length ? '\nBlockers: ' + s.notes.join('; ') + '\n' : ''));
+  }
 }
 function readReview(s) {
   const file = path.join(s.job, 'review.json');
