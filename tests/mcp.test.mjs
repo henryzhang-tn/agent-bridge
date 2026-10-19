@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const server = fileURLToPath(new URL('../plugins/agent-bridge/scripts/mcp-server.mjs', import.meta.url));
@@ -153,8 +153,9 @@ test('malformed task contracts are refused before preparation and worker startup
   assert.equal(fs.existsSync(path.join(f.root, '.ai')), false);
   assert.equal(f.requestLog().length, 0);
 });
-function fixture(t) {
+function fixture(t, { logsInMetadata = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-mcp-'));
+  const logRelative = logsInMetadata ? '.ai/rpc.jsonl' : 'rpc.jsonl';
   const entry = path.join(root, 'fake-app-server.mjs');
   const config = path.join(root, 'providers.json');
   fs.writeFileSync(config, JSON.stringify({ config: { providerConfigRules: { providerRules: [{ providerId: 'fixture', config: { api: { baseUrl: 'http://127.0.0.1:9000' } } }] } } }));
@@ -164,7 +165,7 @@ let selection;
 const models=['GLM-5.3','GLM-5.3-Flash'].map(modelId=>({ref:{providerId:'fixture',modelId},providerLabel:'Synthetic',reasoning:{levels:['low','high','max'].map(value=>({value}))}}));
 const snapshot=()=>({session:{sessionId:'sess_fake',status:'idle'},settings:{model:{current:selection||models[0].ref,available:models}},projection:{status:'idle'},messages:[{info:{role:'assistant'},parts:[{type:'text',text:'Synthetic result for '+selection?.modelId}]}]});
 readline.createInterface({input:process.stdin}).on('line',line=>{
- const m=JSON.parse(line);fs.appendFileSync('rpc.jsonl',JSON.stringify(m)+'\\n');
+ const m=JSON.parse(line);const logPath=new URL(${JSON.stringify(logRelative)},import.meta.url);fs.mkdirSync(new URL('.',logPath),{recursive:true});fs.appendFileSync(logPath,JSON.stringify(m)+'\\n');
  if(m.method==='session/create')send({id:m.id,result:snapshot()});
  else if(m.method==='session/resume')send({id:m.id,result:snapshot()});
  else if(m.method==='session/setModel'){selection=m.params.model;send({id:m.id,result:snapshot()});}
@@ -172,7 +173,11 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  else if(m.method==='session/send'){
   send({id:m.id,result:{accepted:true}});
   const card=fs.readFileSync(m.params.content.match(/Read the task card at (.+\\/task\\.md)\\. Read/)[1],'utf8');
-  if(card.includes('PROGRESS_TEST')){
+  const edit=card.match(/PARALLEL_EDIT (src\\/[a-z-]+\\.txt)/);
+  if(edit){
+   fs.writeFileSync(edit[1],'completed '+edit[1]+'\\n');
+   const timer=setInterval(()=>{if(fs.existsSync(new URL('.ai/parallel-release',import.meta.url))){clearInterval(timer);send({method:'state.updated',params:{sessionId:'sess_fake',reason:'prompt_completed'}});}},50);
+  }else if(card.includes('PROGRESS_TEST')){
    let seq=0;
    const event=(type,payload)=>send({method:'session/event',params:{sessionId:'sess_fake',eventId:'ev_'+seq,seq:++seq,type,payload,timestamp:Date.now()}});
    send({method:'state.updated',params:{sessionId:'sess_fake',reason:'prompt_started'}});
@@ -213,7 +218,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     lines.close(); child.stdin.end(); child.kill();
     fs.rmSync(root, { recursive: true, force: true });
   });
-  const requestLog = () => fs.existsSync(path.join(root, 'rpc.jsonl')) ? fs.readFileSync(path.join(root, 'rpc.jsonl'), 'utf8').trim().split('\n').map(JSON.parse) : [];
+  const requestLog = () => fs.existsSync(path.join(root, logRelative)) ? fs.readFileSync(path.join(root, logRelative), 'utf8').trim().split('\n').map(JSON.parse) : [];
   const args = { worker: 'zcode', project: root, task: 'Read this synthetic fixture only.', read_scope: [], provider: 'fixture', model: 'GLM-5.3-Flash', effort: 'high', selection_reason: 'Synthetic task tests explicit agent model and effort selection.', mode: 'plan', timeout_seconds: 10 };
   const dispatch = async overrides => {
     const selection = { ...args, ...overrides };
@@ -226,6 +231,87 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   };
   return { root, rpc, call, requestLog, dispatch, args, config, jobs };
 }
+
+test('parallel MCP loop runs host and two workers, reviews host artifact and accepts the integrated version', async t => {
+  const f = fixture(t, { logsInMetadata: true }), project = fs.realpathSync(f.root);
+  const git = args => execFileSync('git', args, { cwd: project, stdio: ['ignore', 'pipe', 'pipe'] }).toString();
+  git(['init', '--quiet']); git(['config', 'user.name', 'Fixture']); git(['config', 'user.email', 'fixture@example.invalid']);
+  fs.mkdirSync(path.join(project, 'src'));
+  for (const name of ['host', 'worker-a', 'worker-b']) fs.writeFileSync(path.join(project, 'src', name + '.txt'), 'before\n');
+  fs.writeFileSync(path.join(project, '.gitignore'), '.ai/\nfake-app-server.mjs\nproviders.json\n');
+  git(['add', 'src', '.gitignore']); git(['commit', '--quiet', '-m', 'initial']);
+  const head = git(['rev-parse', 'HEAD']);
+  const call = async (name, args) => { const r = await f.call(name, args); assert.equal(r.isError, false, r.content?.[0]?.text); return r.structuredContent; };
+  const initial = await call('prepare_dispatch', { ...f.args, project });
+  const selection = { worker: 'zcode', provider: 'fixture', model: 'GLM-5.3-Flash', effort: 'high', endpoint: initial.destination.endpoint };
+  const created = await call('create_parallel_goal', { project, goal_id: 'parallel-mcp', objective: 'Complete three isolated fixture changes.',
+    context: 'Synthetic fixture only.', read_scope: ['src'], allowed_edits: ['src'], acceptance_criteria: qualityContract().acceptance_criteria,
+    participants: [{ id: 'host', kind: 'host' }, ...['worker-a', 'worker-b'].map(id => ({ id, kind: 'worker', ...selection, mode: 'edit' })),
+      { id: 'reviewer', kind: 'worker', ...selection, mode: 'plan' }],
+    limits: { max_steps: 8, max_reworks: 2, max_no_progress: 3, max_parallel_total: 3, max_parallel_workers: 2 } });
+  const goal = created.goal;
+  const tasks = ['host', 'worker-a', 'worker-b', 'review'].map(id => ({
+    id, kind: id === 'review' ? 'review' : 'implement', depends_on: [], mode: id === 'review' ? 'plan' : 'edit',
+    read_scope: ['src'], task_contract: { ...qualityContract(), preserve: ['Keep other fixture files unchanged.'], allowed_edits: id === 'review' ? [] : ['src/' + id + '.txt'] },
+    ...(id === 'review' ? { review_of: 'host' } : {}),
+  }));
+  await call('plan_goal_tasks', { goal, operation_id: 'plan', plan_version: 0, tasks });
+  const claims = {};
+  const owned = (id, operation_id) => ({ goal, operation_id, task_id: id, attempt_id: claims[id].attempt_id,
+    owner_session_id: claims[id].owner_session_id, lease_token: claims[id].lease_token });
+  const claim = async (id, participant_id = id) => {
+    claims[id] = await call('claim_goal_task', { goal, operation_id: 'claim-' + id, task_id: id, participant_id, owner_session_id: 'mcp-session' });
+    return claims[id];
+  };
+  const startWorker = async id => {
+    const c = claims[id];
+    const chosen = { ...f.args, project: c.workspace.path, mode: c.mode, read_scope: c.read_scope, task_contract: c.task_contract,
+      task: id === 'review' ? 'Inspect the submitted host source. ' + c.review_context : 'PARALLEL_EDIT src/' + id + '.txt' };
+    const preflight = await call('prepare_dispatch', chosen);
+    const started = await call('start_goal_task', { ...owned(id, 'start-' + id), execution: { ...chosen, endpoint: preflight.destination.endpoint, prepared_ref: preflight.preparedRef } });
+    const job = started.attempts.find(a => a.id === c.attempt_id).job; f.jobs.push(job); return job;
+  };
+  await claim('host'); await call('start_goal_task', owned('host', 'start-host'));
+  await claim('worker-a'); await claim('worker-b');
+  assert.equal(new Set(Object.values(claims).map(c => c.workspace.path)).size, 3);
+  const jobs = await Promise.all(['worker-a', 'worker-b'].map(startWorker));
+  const running = await call('goal_status', { goal });
+  assert.equal(running.capacity.total, 3); assert.equal(running.capacity.workers, 2);
+  assert.ok(running.attempts.every(a => a.status === 'running'));
+  fs.writeFileSync(path.join(claims.host.workspace.path, 'src/host.txt'), 'completed src/host.txt\n');
+  fs.writeFileSync(path.join(project, '.ai/parallel-release'), 'release');
+  const submitted = {};
+  for (let i = 0; i < jobs.length; i++) {
+    const id = ['worker-a', 'worker-b'][i], job = jobs[i];
+    const done = await call('task_status', { job, wait_seconds: 3 }); assert.equal(done.status, 'ready_for_review');
+    assert.equal(fs.readFileSync(path.join(claims[id].workspace.path, 'src/' + id + '.txt'), 'utf8'), 'completed src/' + id + '.txt\n');
+    await call('record_review', { job, review_id: 'worker-reviewed', checks: reviewChecks() });
+    submitted[id] = await call('submit_goal_task', { ...owned(id, 'submit-' + id), summary: 'Verified fixture modification.' });
+  }
+  submitted.host = await call('submit_goal_task', { ...owned('host', 'submit-host'), summary: 'Host fixture modification.' });
+  const fingerprint = id => submitted[id].attempts.find(a => a.id === claims[id].attempt_id).artifact.fingerprint;
+  const review = (id, reviewer_task_id) => call('review_goal_task', { goal, operation_id: 'review-' + id, task_id: id, attempt_id: claims[id].attempt_id,
+    artifact_fingerprint: fingerprint(id), checks: reviewChecks(), ...(reviewer_task_id ? { reviewer_task_id } : {}) });
+  const premature = await f.call('review_goal_task', { goal, operation_id: 'host-self-review', task_id: 'host', attempt_id: claims.host.attempt_id,
+    artifact_fingerprint: fingerprint('host'), checks: reviewChecks() });
+  assert.equal(premature.isError, true); assert.match(premature.content[0].text, /independent worker review/);
+  for (const id of ['worker-a', 'worker-b']) { await review(id); await call('integrate_goal_task', owned(id, 'integrate-' + id)); }
+  const reviewer = await claim('review', 'reviewer');
+  for (const id of ['host', 'worker-a', 'worker-b']) assert.equal(fs.readFileSync(path.join(reviewer.workspace.path, 'src/' + id + '.txt'), 'utf8'), 'completed src/' + id + '.txt\n');
+  const reviewerJob = await startWorker('review');
+  assert.equal((await call('task_status', { job: reviewerJob, wait_seconds: 3 })).status, 'ready_for_review');
+  await call('record_review', { job: reviewerJob, review_id: 'independent-review-checked', checks: reviewChecks() });
+  submitted.review = await call('submit_goal_task', { ...owned('review', 'submit-review'), summary: 'Inspected the exact host artifact and seeded integrated changes.' });
+  await review('review'); await call('integrate_goal_task', owned('review', 'integrate-review'));
+  await review('host', 'review'); await call('integrate_goal_task', owned('host', 'integrate-host'));
+  for (const id of ['host', 'worker-a', 'worker-b']) assert.equal(fs.readFileSync(path.join(project, 'src/' + id + '.txt'), 'utf8'), 'completed src/' + id + '.txt\n');
+  const status = await call('goal_status', { goal });
+  const final = await call('record_goal_review', { goal, review_id: 'all-integrated', snapshot_fingerprint: status.snapshot_fingerprint, checks: reviewChecks() });
+  assert.equal(final.status, 'completed'); assert.ok(final.tasks.every(t => t.status === 'integrated'));
+  assert.equal(final.capacity.total, 0); assert.equal(final.budget.used.steps, 4);
+  assert.equal(git(['rev-parse', 'HEAD']), head); assert.equal(git(['diff', '--cached', '--name-only']), '');
+  assert.equal(f.requestLog().filter(r => r.method === 'session/send').length, 3);
+});
 
 test('MCP initialization, discovery and model catalog do not invoke inference', async t => {
   const f = fixture(t);

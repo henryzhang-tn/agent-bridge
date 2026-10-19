@@ -8,7 +8,7 @@ $agent-bridge:loop -w=claude -m=glm-5.3 实现 <目标>，修改范围 <目录>�
 
 模型、provider 和 endpoint 以实际发现与预检为准。首次授权覆盖的目的地、项目和范围内可以继续推进；创建目标、收到消息或保存预检记录都不增加授权。
 
-## 流程
+## 串行目标流程
 
 1. 发现执行资源并预检目的地，定义整体完成标准、读写范围、固定参与者和有限预算。`create_goal` 保存目标，返回绝对 `goal` 路径。
 2. 用 `read_goal_messages` 获取相关消息和上下文，在任务卡中选取本轮需要的信息，再调用 `prepare_dispatch`。消息必须在预检前加入，派发时不能更改绑定内容。
@@ -51,7 +51,37 @@ $agent-bridge:loop -w=claude -m=glm-5.3 实现 <目标>，修改范围 <目录>�
 
 消息属于主控转发：`source_job` 必须引用本目标中已结束的任务，发送者由该任务归属推导；未引用任务时来自主控。消息只发给已登记参与者或主控，产物引用必须在目标范围内。消息中的建议不能修改权限、目标或验收结果。
 
-第一版是宿主会话驱动的串行轮次，没有运行中消息注入、后台自动唤醒或同目录并行修改。恢复需要宿主显式继续；各 worker 的原生续接能力仍以现有适配器为准。
+串行目标保持原有轮次和续接行为。并行目标使用下面的任务协议；两者都由宿主会话驱动，没有运行中消息注入或后台自动唤醒。恢复需要宿主显式继续。
+
+## 宿主参与和并行任务
+
+任务较多时，宿主可以执行一个子任务，同时调度多个 worker。建议先设置 `max_parallel_total: 3`、`max_parallel_workers: 2`；实际数量由用户约束、任务独立性和运行资源决定，多个实例不会增加服务商额度。一个参与者同时最多持有一个活动任务。写入范围重叠的任务需要顺序处理，前一份产物集成或被拒绝后才释放范围预约。
+
+并行目标用 `create_parallel_goal` 显式创建（schema 2），已有 `create_goal` 保持 schema 1。首期要求干净的 Git 项目，已有修改或非 Git 项目应保留现状并使用串行目标，不自动 stash 或 reset。根目录中被 Git 忽略的本地配置不会复制到 worktree；每个实际工作区都需要独立预检，声明的读写范围不等于操作系统隔离。
+
+| 工具 | 用途 |
+| --- | --- |
+| `create_parallel_goal` | 固定目标、整体标准、参与者、累计预算和并发上限 |
+| `plan_goal_tasks` | 按 `plan_version` 追加任务及依赖；拒绝循环和未知依赖 |
+| `claim_goal_task` | 原子认领任务、参与者及执行名额，创建独立 worktree |
+| `start_goal_task` | 启动宿主任务，或派发已在实际 worktree 预检的 worker |
+| `submit_goal_task` | 执行结束后提交固定产物，或由宿主确认停止修改 |
+| `review_goal_task` | 验证该次产物及逐项证据，决定通过或返修 |
+| `integrate_goal_task` | 串行集成通过的产物，验证前像和当前源码 |
+
+1. 参与者必须包含一个 `{ id: "host", kind: "host" }`。worker 使用 `kind: "worker"` 并固定实际发现的 `worker / provider / model / effort / endpoint / mode`。创建字段与串行目标相近，`limits` 额外要求两项并发上限。
+2. 任务包含 `id / kind / depends_on / read_scope / mode / task_contract`，其中 `kind` 为 `implement / research / review`。追加计划要传当前 `plan_version`；已有任务和契约保持不变。普通依赖必须已集成。独立评审用 `kind: "review", mode: "plan", review_of: "<task_id>"`，读取目标任务已提交的产物；不要同时把目标放入 `depends_on`，否则会等待它先集成。
+3. 认领使用 `task_id / participant_id / owner_session_id / operation_id`。返回 `attempt_id / lease_token / workspace / task_contract / read_scope / mode`。后续启动、提交和集成绑定原会话与 token；状态查询不回传 token，保存它用于当前任务恢复，不能靠会话过期认定旧执行已停止。
+4. 宿主在返回的 `workspace.path` 工作，`start_goal_task` 不传 `execution`。worker 用该路径、返回的契约和范围准备任务，先 `prepare_dispatch`，再把完整结果交给 `start_goal_task.execution`。评审任务还要在预检前将返回的 `review_context` 加入任务文本，绑定被评审产物。
+5. worker 结束后先检查实际结果并调用原 `record_review`，通过后才能 `submit_goal_task`。宿主直接提交自己的产物。`review_goal_task` 接收本次 `artifact_fingerprint` 和逐项检查；宿主编辑任务通过时必须引用 `reviewer_task_id`，由另一个已经结束且独立验收通过的只读 worker 检查同一份产物。
+6. 调用 `integrate_goal_task` 把产物逐项集成回原项目。新 worktree 从原提交加已集成产物建立基线；评审工作区另加入待评审产物。每个任务提交的只是相对自身基线的增量。共享文件变化或冲突会阻止集成，保留现场，不自动覆盖、提交或合并代码。
+7. 所有计划任务都集成后，获取原项目的 `snapshot_fingerprint`，运行整体检查，用 `record_goal_review` 完成目标。子任务通过不能替代整体检查；完成后的源码变化会使旧验收失效。
+
+`goal_status / send_goal_message / read_goal_messages / record_goal_review` 同样用于并行目标。`advance_goal` 对并行目标只处理暂停、恢复、取消、等待输入、上下文更新和对账，拒绝旧的 `dispatch / continue` 动作。子任务返修通过重新认领失败任务创建新尝试，沿用原契约并消耗预算；原尝试和产物保留。
+
+认领即占用累计步骤预算和并发名额，派发结果未知仍占名额。结果返回但尚未提交的已结束 worker 可以释放运行名额。暂停不终止正在运行的任务；取消会请求停止 worker，宿主任务需要持原所有权以 `submit_goal_task.outcome: "cancelled"` 明确确认已经停止。失联、心跳超时或宿主重启不会自动重派。恢复未知派发时使用原操作 ID、预检和参数，不另开一个 worker。
+
+并行目标的无进展按任务记录并累计到总预算，其他任务的成功不能清掉本任务失败记录。编辑产物未变时，仅改摘要或证据不算进展。工作区、产物及操作记录保存在 `.ai/goals/`，保留用于排查和恢复；首期没有自动回收工作区、后台守护进程或同一目录多写者。
 
 ## 验证
 

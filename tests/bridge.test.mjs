@@ -105,11 +105,21 @@ test('failed and cancelled requests are not automatically rerun; new IDs start n
   assert.equal(fs.readFileSync(path.join(f.project, 'worker-starts.txt'), 'utf8').trim().split('\n').length, 3);
 });
 
+async function startedWorker(project, statePath) {
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    if (Number.isInteger(state.childPid) && state.childPid > 1 && fs.existsSync(path.join(project, 'worker-starts.txt'))) return state;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  assert.fail('Synthetic worker did not start before supervisor interruption');
+}
+
 test('dead supervisor retains the lock while its worker lives; explicit cancel stops the orphan', async t => {
   const f = fixture(t);
   const job = await f.submit('hang', ['--timeout', '30']);
   const statePath = path.join(job.job, 'state.json');
-  const s = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  const s = await startedWorker(f.project, statePath);
   process.kill(s.runnerPid, 'SIGKILL');
   await new Promise(resolve => setTimeout(resolve, 150));
   s.updatedAt = Date.now() - 15000; fs.writeFileSync(statePath, JSON.stringify(s));
@@ -128,7 +138,7 @@ test('dead supervisor and worker become interrupted without spawning or discardi
   const f = fixture(t);
   const job = await f.submit('hang', ['--timeout', '30', '--request-id', 'interrupted-001']);
   const statePath = path.join(job.job, 'state.json');
-  const s = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  const s = await startedWorker(f.project, statePath);
   fs.writeFileSync(path.join(f.project, 'partial.txt'), 'preserve me');
   process.kill(s.runnerPid, 'SIGKILL'); process.kill(-s.childPid, 'SIGKILL');
   await new Promise(resolve => setTimeout(resolve, 150));
@@ -160,7 +170,7 @@ test('interrupted cancellation retains cancelled status and does not become reco
   const f = fixture(t);
   const job = await f.submit('hang', ['--timeout', '30', '--request-id', 'cancel-race-001']);
   const statePath = path.join(job.job, 'state.json');
-  const s = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  const s = await startedWorker(f.project, statePath);
   process.kill(s.runnerPid, 'SIGKILL');
   fs.writeFileSync(path.join(job.job, 'cancel.request'), 'cancel\n');
   process.kill(-s.childPid, 'SIGKILL');

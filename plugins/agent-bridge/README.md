@@ -4,8 +4,10 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `scripts/mcp-server.mjs` | 16 个 MCP 工具、参数校验 |
+| `scripts/mcp-server.mjs` | 23 个 MCP 工具、参数校验 |
 | `scripts/goals.mjs` | 目标状态、串行决策、主控消息转发、累计预算与源码版本验收 |
+| `scripts/parallel-goals.mjs` | 并行目标、任务依赖、宿主与 worker 认领、产物评审与调度恢复 |
+| `scripts/goal-workspaces.mjs` | 独立 Git worktree、源码基线、产物范围检查与串行集成 |
 | `scripts/quality.mjs` | 任务标准校验、推理建议、验收证据规则和质量状态 |
 | `scripts/destination.mjs` / `codex-config.mjs` | 本地解析实际 provider/endpoint（Codex 使用其生效配置和登录类型），显式识别宿主 |
 | `scripts/bridge.mjs` | 预检、参数绑定、任务锁、去重、取消、检查点、续接、结果恢复 |
@@ -92,7 +94,7 @@ worker 返回并退出后，宿主独立检查文件和执行验证，再调用 
 
 验收记录保存在私有 `.ai/tasks/<job>/reviews/`，最新记录在 `review.json`，权限为 0600。相同 `review_id` 和证据重试复用已有记录，不启动推理，也不撤销更新的验收；改变证据需新 ID。结果或执行状态变化时既有验收标记 `stale`。验收反映记录时的验证，后续源码变化仍须重新验证。
 
-单任务返修使用显式 `continue_task`，原 contract 和标准保持不变，失败/未验证项与证据自动进入交接提示；新任务记录 `reworkCount`。两次返修后提示宿主重新评估根因、拆分或模型，单任务执行器不自动循环或切换模型。显式启用 [Goal Loop](GOAL_LOOP.md) 时，由宿主通过 `advance_goal` 在累计预算内推进派发与续接。CLI 对应 `review --job DIR --review-id ID --review-file CHECKS_JSON`（文件内容是 checks 数组）；目标工具当前由 MCP 提供。
+单任务返修使用显式 `continue_task`，原 contract 和标准保持不变，失败/未验证项与证据自动进入交接提示；新任务记录 `reworkCount`。两次返修后提示宿主重新评估根因、拆分或模型，单任务执行器不自动循环或切换模型。显式启用 [Goal Loop](GOAL_LOOP.md) 时，串行目标由宿主通过 `advance_goal` 推进派发与续接；并行目标使用任务认领、启动、提交、评审和集成工具。两者都受累计预算约束。CLI 对应 `review --job DIR --review-id ID --review-file CHECKS_JSON`（文件内容是 checks 数组）；目标工具当前由 MCP 提供。
 
 `effortEvidence` 分开记录 `requested`、`sentToRuntime`、`runtimeConfirmed`、`providerConfirmed`、参数位置和确认来源。没有回传确认时为 null；发送参数不等于服务端确认思考预算。Z Code 可记录模型设置回执；Codex 只使用当前回合的明确 effort 回执，不把线程原有默认值当作本回合确认。Claude/Hermes 通常没有 effort 回传，因此不声称已确认。`selectedModel` 保留为兼容的选择元数据。
 
