@@ -2,6 +2,8 @@
 
 Loop 在单任务执行之上保存总目标、参与者、轮次、消息和验收证据。当前宿主 Agent 负责持续选择下一步，Bridge 执行每一轮并记录状态。可用于“实现 → 评审 → 返修 → 整体验收”。
 
+面向使用者的配置与流程说明见 [Agent Loop 与并行任务](https://docs.google.com/document/d/1CZk0eO7RTbrD9ZVFUe3qW9Am_YJCWy8YYtcBrTR-Q1k/edit)。文档中的两张图与本页共用图源；在仓库根目录运行 `python3 scripts/draw-goal-diagrams.py` 可重新绘制，需要 Pillow 和中文字体。非 macOS 环境可通过 `DIAGRAM_FONT / DIAGRAM_BOLD_FONT` 指定字体文件。
+
 ```text
 $agent-bridge:loop -d=max -w=claude -m=glm-5.3 -e=high 实现 <目标>，修改范围 <目录>，最多 8 个任务、3 次返修
 ```
@@ -14,16 +16,7 @@ $agent-bridge:loop -d=max -w=claude -m=glm-5.3 -e=high 实现 <目标>，修改�
 
 `high / max` 要求登记一个 `mode: "plan"` 的设计 worker。实现者另用 `mode: "edit"` 的参与者，可以使用同一运行时和模型，但不能把设计者的读取权限自动升级。宿主先明确用户目标、范围和完成标准，再让 worker 提出方案与任务图。worker 不自行派发其他 worker。
 
-```mermaid
-flowchart TD
-    U[用户目标、范围和完成标准] --> D[worker 设计与拆分]
-    D --> R{宿主审核具体方案版本}
-    R -->|修改要求| D
-    R -->|通过| W[worker 按获批任务实现与自测]
-    W --> V{宿主检查产物和证据}
-    V -->|返修要求| W
-    V -->|通过| I[串行集成与整体验证]
-```
+![按下放强度推进设计、执行与返修](docs/diagrams/agent-loop-flow.png)
 
 设计的提交与审核流程如下；所有步骤共用目标的累计预算。
 
@@ -125,6 +118,8 @@ worker 的输出必须包含且只包含一个 `agent-bridge-design` JSON 代码
 串行目标保持原有轮次和续接行为。并行目标使用下面的任务协议；两者都由宿主会话驱动，没有运行中消息注入或后台自动唤醒。恢复需要宿主显式继续。
 
 ## 宿主参与和并行任务
+
+![不同下放强度下的并行分工](docs/diagrams/parallel-tasks-flow.png)
 
 任务较多时，`low / medium / high` 的宿主可以执行一个子任务，同时调度多个 worker；`max` 的宿主负责审核和调度。建议先设置 `max_parallel_total: 3`、`max_parallel_workers: 2`；实际数量由用户约束、任务独立性和运行资源决定，多个实例不会增加服务商额度。一个参与者同时最多持有一个活动任务。写入范围重叠的任务需要顺序处理，前一份产物集成或被拒绝后才释放范围预约。
 
